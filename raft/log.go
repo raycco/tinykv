@@ -107,6 +107,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	var entries []pb.Entry
 	if l.stabled < lastIndex {
 		entries, _ = l.storage.Entries(l.stabled+1, lastIndex+1)
+		entries = append(entries, l.entries...)
 	} else {
 		for _, entry := range l.entries {
 			if entry.Index > l.stabled {
