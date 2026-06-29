@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -70,12 +71,17 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	ready Ready
+
+	logPrefix string
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	rawNode := &RawNode{Raft: newRaft(config)}
+	rawNode.logPrefix = fmt.Sprintf("[N%d]", rawNode.Raft.id)
+	return rawNode, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,7 +149,12 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	//softState := &SoftState{rn.Raft.Lead, rn.Raft.State}
+	//hardState, _, _ := rn.Raft.RaftLog.storage.InitialState()
+	entries := rn.Raft.RaftLog.unstableEntries()
+	commitedEnts := rn.Raft.RaftLog.nextEnts()
+	msgs := rn.Raft.msgs
+	return Ready{nil, pb.HardState{}, entries, pb.Snapshot{}, commitedEnts, msgs}
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
@@ -156,6 +167,9 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+
+	rn.Raft.RaftLog.applied = rn.Raft.RaftLog.committed
+	rn.Raft.RaftLog.stabled = rn.Raft.RaftLog.committed
 }
 
 // GetProgress return the Progress of this node and its peers, if this

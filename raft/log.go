@@ -60,7 +60,9 @@ type RaftLog struct {
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	stabled, _ := storage.LastIndex()
-	return &RaftLog{storage: storage, applied: 0, committed: 0, stabled: stabled}
+	hardState, _, _ := storage.InitialState()
+	snap, _ := storage.Snapshot()
+	return &RaftLog{storage: storage, applied: snap.Metadata.Index, committed: hardState.Commit, stabled: stabled}
 }
 
 // We need to compact the log entries in some point of time like
@@ -127,6 +129,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	entries, err := l.storage.Entries(l.applied+1, l.committed+1)
 	if err != nil {
+		log.Errorf("get commited entries error: %+v", err)
 		return nil
 	}
 	return entries

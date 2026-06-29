@@ -254,15 +254,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
 	log.Infof("%s send heartbeat to %+v match %+v leader match %+v", r.logPrefix, to, r.Prs[to], r.Prs[r.id])
-	term, _ := r.RaftLog.Term(r.Prs[r.id].Match)
+	//term, _ := r.RaftLog.Term(r.Prs[r.id].Match)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
 		Commit:  r.RaftLog.committed,
-		Index:   r.Prs[r.id].Match,
-		LogTerm: term,
+		//Index:   r.Prs[r.id].Match,
+		//LogTerm: term,
 	}
 
 	r.msgs = append(r.msgs, msg)
@@ -448,6 +448,10 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) startNoop() {
 	entries := []*pb.Entry{{}}
 	r.startOps(entries)
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = r.RaftLog.LastIndex()
+		r.apply()
+	}
 }
 
 func (r *Raft) startOps(entries []*pb.Entry) {
@@ -640,7 +644,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		Term:    r.Term,
 	}
 
-	term, _ := r.RaftLog.Term(m.Index)
+	/*term, _ := r.RaftLog.Term(m.Index)
 	if r.RaftLog.LastIndex() < m.Index || term != m.LogTerm {
 		r.msgs = append(r.msgs, msg)
 		return
@@ -652,6 +656,23 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		} else {
 			r.RaftLog.committed = r.Prs[r.id].Match
 		}
+	}*/
+
+	maxSameTermIdx := r.RaftLog.committed
+	lastIdx := r.RaftLog.LastIndex()
+	for idx := r.RaftLog.committed + 1; idx <= lastIdx; idx++ {
+		term, _ := r.RaftLog.Term(idx)
+		if term == r.Term {
+			maxSameTermIdx = idx
+		} else {
+			continue
+		}
+	}
+
+	if m.Commit > maxSameTermIdx {
+		r.RaftLog.committed = maxSameTermIdx
+	} else {
+		r.RaftLog.committed = m.Commit
 	}
 
 	r.apply()
