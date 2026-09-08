@@ -160,6 +160,9 @@ func (rn *RawNode) Ready() Ready {
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	if len(rn.Raft.msgs) > 0 {
+		return true
+	}
 	return false
 }
 
@@ -168,8 +171,11 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 
-	rn.Raft.RaftLog.applied = rn.Raft.RaftLog.committed
-	rn.Raft.RaftLog.stabled = rn.Raft.RaftLog.committed
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		rn.Raft.RaftLog.stabled = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
+	rn.Raft.msgs = make([]pb.Message, 0)
 }
 
 // GetProgress return the Progress of this node and its peers, if this

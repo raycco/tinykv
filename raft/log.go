@@ -61,8 +61,8 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	stabled, _ := storage.LastIndex()
 	hardState, _, _ := storage.InitialState()
-	snap, _ := storage.Snapshot()
-	return &RaftLog{storage: storage, applied: snap.Metadata.Index, committed: hardState.Commit, stabled: stabled}
+	//snap, _ := storage.Snapshot()
+	return &RaftLog{storage: storage, applied: 0, committed: hardState.Commit, stabled: stabled}
 }
 
 // We need to compact the log entries in some point of time like
@@ -127,11 +127,24 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	entries, err := l.storage.Entries(l.applied+1, l.committed+1)
-	if err != nil {
-		log.Errorf("get commited entries error: %+v", err)
-		return nil
+	lastIndex, _ := l.storage.LastIndex()
+	log.Infof("get commited entries: applied = %+v, committed = %+v, storage lastIndex = %+v  lastIndex = %+v",
+		l.applied, l.committed, lastIndex, l.LastIndex())
+	var entries []pb.Entry
+	if l.applied < lastIndex {
+		if lastIndex > l.committed {
+			entries, _ = l.storage.Entries(l.applied+1, l.committed+1)
+		} else {
+			entries, _ = l.storage.Entries(l.applied+1, lastIndex+1)
+		}
 	}
+
+	for _, entry := range l.entries {
+		if entry.Index <= l.committed && entry.Index > l.applied {
+			entries = append(entries, entry)
+		}
+	}
+
 	return entries
 }
 
@@ -166,8 +179,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 
 func (l *RaftLog) ArrIndex(i uint64) int {
 	// Your Code Here (2A).
-	arrIndex := 0
-	for _, entry := range l.entries {
+	for arrIndex, entry := range l.entries {
 		if entry.Index == i {
 			return arrIndex
 		}

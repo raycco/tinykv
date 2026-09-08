@@ -173,7 +173,7 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 
-	hardState, _, _ := c.Storage.InitialState()
+	hardState, confState, _ := c.Storage.InitialState()
 	raft := &Raft{
 		id:                  c.ID,
 		Term:                hardState.Term,
@@ -188,13 +188,23 @@ func newRaft(c *Config) *Raft {
 		heartbeatElapsed:    0,
 		electionElapsed:     0,
 	}
-	for _, peer := range c.peers {
-		raft.Prs[peer] = &Progress{0, 1}
+
+	if len(confState.Nodes) > 0 {
+		for _, peer := range confState.Nodes {
+			raft.Prs[peer] = &Progress{hardState.Commit, hardState.Commit + 1}
+		}
+	} else {
+		for _, peer := range c.peers {
+			raft.Prs[peer] = &Progress{0, 1}
+		}
 	}
+
+	//raft.RaftLog.applied = c.Applied
 
 	raft.logPrefix = fmt.Sprintf("[S%d]", raft.id)
 
 	raft.random = *NewRandomGenerator(c.ElectionTick)
+	raft.resetElectionTimeout()
 	log.New()
 
 	return raft
@@ -206,6 +216,7 @@ func (r *Raft) sendAppends() {
 			r.sendAppend(peer)
 		}
 	}
+	r.resetElectionTimeout()
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -218,9 +229,17 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	log.Infof("%s send append prevLogIndex: %+v, prevLogTerm: %+v, stable: %+v",
 		r.logPrefix, prevLogIndex, prevLogTerm, r.RaftLog.stabled)
-	log.Infof("%s send append entries: %+v", r.logPrefix, r.RaftLog.entries)
-	entries := make([]pb.Entry, r.RaftLog.LastIndex()-prevLogIndex)
-	copy(entries, r.RaftLog.allEntries()[prevLogIndex:])
+
+	log.Infof("%s send append entries: %+v", r.logPrefix, r.RaftLog.allEntries())
+
+	//entries := make([]pb.Entry, r.RaftLog.LastIndex()-prevLogIndex)
+	var entries []pb.Entry
+	for _, entry := range r.RaftLog.allEntries() {
+		if entry.Index >= r.Prs[to].Next {
+			entries = append(entries, entry)
+		}
+	}
+	//copy(entries, r.RaftLog.allEntries()[nextArrIndex:])
 
 	log.Infof("%s send append LII: %+v, push entries: %+v", r.logPrefix, r.RaftLog.LastIndex(), entries)
 	msg := pb.Message{
@@ -282,6 +301,7 @@ func (r *Raft) sendRequestVote(to uint64) {
 	}
 
 	r.msgs = append(r.msgs, msg)
+	log.Infof("%s send request vote to %+v msg %+v", r.logPrefix, to, r.msgs)
 }
 
 func (r *Raft) resetElectionTimeout() {
@@ -290,6 +310,7 @@ func (r *Raft) resetElectionTimeout() {
 }
 
 func (r *Raft) startElection() {
+	log.Debugf("%s start election, peers: %+v", r.logPrefix, r.Prs)
 	r.becomeCandidate()
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
@@ -311,6 +332,7 @@ func (r *Raft) sendHeartbeats() {
 		}
 	}
 	r.heartbeatElapsed = 0
+	r.resetElectionTimeout()
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -484,6 +506,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		To:      m.From,
 		Term:    r.Term,
 	}
+	r.resetElectionTimeout()
 
 	// 1. Reply false if term < currentTerm (§5.1)
 	if m.Term < r.Term {
@@ -527,12 +550,19 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if len(entries) > 0 {
 		if index <= r.RaftLog.stabled {
 			if entries[len(entries)-1].Index >= r.RaftLog.stabled {
-				r.RaftLog.storage.(*MemoryStorage).Append(entries[:r.RaftLog.stabled-entries[0].Index+1])
-				if entries[len(entries)-1].Index > r.RaftLog.stabled {
-					r.RaftLog.entries = append(r.RaftLog.entries, entries[r.RaftLog.stabled-entries[0].Index+1:]...)
+				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
+					storage.Append(entries[:r.RaftLog.stabled-entries[0].Index+1])
+					//r.RaftLog.storage.(*MemoryStorage).Append(entries[:r.RaftLog.stabled-entries[0].Index+1])
+					if entries[len(entries)-1].Index > r.RaftLog.stabled {
+						r.RaftLog.entries = append(r.RaftLog.entries, entries[r.RaftLog.stabled-entries[0].Index+1:]...)
+					}
 				}
+
 			} else {
-				r.RaftLog.storage.(*MemoryStorage).Append(entries)
+				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
+					storage.Append(entries)
+					//r.RaftLog.storage.(*MemoryStorage).Append(entries)
+				}
 			}
 		} else {
 			r.RaftLog.entries = append(r.RaftLog.entries, entries...)
@@ -618,17 +648,16 @@ func (r *Raft) apply() {
 				entries = append(entries, entry)
 			}
 		}
-		err := r.RaftLog.storage.(*MemoryStorage).Append(entries)
-		if len(r.RaftLog.entries) > 0 {
-			log.Infof("%s apply entries committed: %+v entries[0].Index: %+v", r.logPrefix, r.RaftLog.committed, r.RaftLog.entries[0].Index)
-			truncateIndex := r.RaftLog.committed - r.RaftLog.entries[0].Index + 1
-			r.RaftLog.entries = r.RaftLog.entries[truncateIndex:]
+		if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
+			storage.Append(entries)
+
+			if len(r.RaftLog.entries) > 0 {
+				log.Infof("%s apply entries committed: %+v entries[0].Index: %+v", r.logPrefix, r.RaftLog.committed, r.RaftLog.entries[0].Index)
+				truncateIndex := r.RaftLog.committed - r.RaftLog.entries[0].Index + 1
+				r.RaftLog.entries = r.RaftLog.entries[truncateIndex:]
+			}
 		}
 		log.Infof("%s apply end committed %d entries: %+v ", r.logPrefix, r.RaftLog.committed, r.RaftLog.entries)
-
-		if err == nil {
-			//r.RaftLog.applied = r.RaftLog.committed
-		}
 	}
 }
 
@@ -657,6 +686,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			r.RaftLog.committed = r.Prs[r.id].Match
 		}
 	}*/
+
+	r.resetElectionTimeout()
 
 	maxSameTermIdx := r.RaftLog.committed
 	lastIdx := r.RaftLog.LastIndex()
@@ -732,7 +763,6 @@ func (r *Raft) handleRequestVoteRsp(m pb.Message) {
 	if count > len(r.Prs)/2 {
 		r.becomeLeader()
 		r.sendHeartbeats()
-		r.resetElectionTimeout()
 	}
 
 	if len(r.votes) == len(r.Prs) && count <= len(r.Prs)/2 {

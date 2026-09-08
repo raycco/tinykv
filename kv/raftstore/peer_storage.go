@@ -308,7 +308,16 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
-	return nil
+	for _, entry := range entries {
+		if entry.Index <= ps.applyState.AppliedIndex {
+			continue
+		}
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+
+	err := ps.Engines.WriteRaft(raftWB)
+
+	return err
 }
 
 // Apply the peer with given snapshot
@@ -331,6 +340,16 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	raftWB := new(engine_util.WriteBatch)
+	if len(ready.Entries) > 0 {
+		ps.Append(ready.Entries, raftWB)
+	}
+
+	//ps.raftState.LastIndex = ready.Entries[len(ready.Entries)-1].Index
+	//ps.raftState.LastTerm = ready.Entries[len(ready.Entries)-1].Term
+	ps.raftState.HardState = &ready.HardState
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	ps.Engines.WriteRaft(raftWB)
 	return nil, nil
 }
 
@@ -344,4 +363,23 @@ func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
 		StartKey: start,
 		EndKey:   end,
 	}
+}
+
+func (ps *PeerStorage) ReadKV(cf string, key []byte) ([]byte, error) {
+	value, err := engine_util.GetCF(ps.Engines.Kv, cf, key)
+	return value, err
+}
+
+func (ps *PeerStorage) WriteKV(cf string, key, value []byte) error {
+	err := engine_util.PutCF(ps.Engines.Kv, cf, key, value)
+	return err
+}
+
+func (ps *PeerStorage) DeleteKV(cf string, key []byte) error {
+	err := engine_util.DeleteCF(ps.Engines.Kv, cf, key)
+	return err
+}
+
+func (ps *PeerStorage) SnapKV() *badger.Txn {
+	return ps.Engines.Kv.NewTransaction(false)
 }

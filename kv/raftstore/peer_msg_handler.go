@@ -10,6 +10,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -38,11 +39,90 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+func (d *peerMsgHandler) processPut(put *raft_cmdpb.PutRequest, cb *message.Callback) {
+	err := d.peerStorage.WriteKV(put.Cf, put.Key, put.Value)
+	resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+	putrsp := &raft_cmdpb.PutResponse{}
+	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: putrsp})
+	log.Infof("[S%d] %+v process put key = %+v value = %+v", d.PeerId(), err, string(put.Key), string(put.Value))
+	cb.Done(resp)
+}
+
+func (d *peerMsgHandler) processGet(get *raft_cmdpb.GetRequest, cb *message.Callback) {
+	value, err := d.peerStorage.ReadKV(get.Cf, get.Key)
+	resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+	getrsp := &raft_cmdpb.GetResponse{Value: value}
+	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: getrsp})
+	log.Infof("[S%d] %+v process get key = %+v value = %+v", d.PeerId(), err, string(get.Key), string(value))
+	cb.Done(resp)
+}
+
+func (d *peerMsgHandler) processSnap(snap *raft_cmdpb.SnapRequest, cb *message.Callback) {
+	cb.Txn = d.peerStorage.SnapKV()
+	resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+	snaprsp := &raft_cmdpb.SnapResponse{Region: d.peerStorage.Region()}
+	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: snaprsp})
+	log.Infof("[S%d] process snap %+v", d.PeerId(), resp)
+
+	cb.Done(resp)
+}
+
+func (d *peerMsgHandler) processDelete(del *raft_cmdpb.DeleteRequest, cb *message.Callback) {
+	err := d.peerStorage.DeleteKV(del.Cf, del.Key)
+	resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+	delrsp := &raft_cmdpb.DeleteResponse{}
+	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: delrsp})
+	log.Infof("[S%d] %+v process delete %+v", d.PeerId(), err, resp)
+
+	cb.Done(resp)
+}
+
+func (d *peerMsgHandler) process(entry eraftpb.Entry) {
+	if len(d.proposals) <= 0 {
+		return
+	}
+	log.Infof("[S%d] process entry = %+v", d.PeerId(), entry)
+	proposal := d.proposals[0]
+	log.Infof("[S%d] process entry proposal = %+v", d.PeerId(), proposal)
+	if entry.Index == proposal.index && entry.Term == proposal.term {
+		var msg raft_cmdpb.RaftCmdRequest
+		err := msg.Unmarshal(entry.Data)
+		if err != nil {
+			log.Infof("[S%d] %+v MarshalTo error", d.PeerId(), err)
+		} else {
+			for _, req := range msg.Requests {
+				switch req.CmdType {
+				case raft_cmdpb.CmdType_Put:
+					d.processPut(req.Put, proposal.cb)
+				case raft_cmdpb.CmdType_Delete:
+					d.processDelete(req.Delete, proposal.cb)
+				case raft_cmdpb.CmdType_Get:
+					d.processGet(req.Get, proposal.cb)
+				case raft_cmdpb.CmdType_Snap:
+					d.processSnap(req.Snap, proposal.cb)
+				}
+			}
+			d.proposals = d.proposals[1:]
+		}
+	}
+}
+
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+
+	if d.RaftGroup.HasReady() {
+		ready := d.RaftGroup.Ready()
+		log.Infof("[S%d] %+v handle raft ready", d.PeerId(), len(ready.Messages))
+		d.peerStorage.SaveReadyState(&ready)
+		d.Send(d.ctx.trans, ready.Messages)
+		for _, entry := range ready.CommittedEntries {
+			d.process(entry)
+		}
+		d.RaftGroup.Advance(ready)
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +194,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	log.Infof("[S%d] proposeRaftCommand %+v", d.PeerId(), msg)
+	// 将整个请求序列化为字节流
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	// 提交至 Raft 组
+	if d.IsLeader() {
+		proposal := &proposal{d.nextProposalIndex(), d.Term(), cb}
+		if err := d.RaftGroup.Propose(data); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		d.proposals = append(d.proposals, proposal)
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +320,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
