@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -151,6 +152,8 @@ func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
 	//softState := &SoftState{rn.Raft.Lead, rn.Raft.State}
 	//hardState, _, _ := rn.Raft.RaftLog.storage.InitialState()
+	log.Infof("%s ready: applied = %+v, committed = %+v, lastIndex = %+v",
+		rn.logPrefix, rn.Raft.RaftLog.applied, rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex())
 	entries := rn.Raft.RaftLog.unstableEntries()
 	commitedEnts := rn.Raft.RaftLog.nextEnts()
 	msgs := rn.Raft.msgs

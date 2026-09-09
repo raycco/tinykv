@@ -592,6 +592,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				}
 			}
 		} else {
+			if len(r.RaftLog.entries) > 0 {
+				// truncate log after conflict index
+				r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
+			}
 			r.RaftLog.entries = append(r.RaftLog.entries, entries...)
 		}
 	}

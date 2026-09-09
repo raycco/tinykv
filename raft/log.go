@@ -128,7 +128,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	lastIndex, _ := l.storage.LastIndex()
-	log.Infof("get commited entries: applied = %+v, committed = %+v, storage lastIndex = %+v  lastIndex = %+v",
+	log.Debugf("get commited entries: applied = %+v, committed = %+v, storage lastIndex = %+v  lastIndex = %+v",
 		l.applied, l.committed, lastIndex, l.LastIndex())
 	var entries []pb.Entry
 	if l.applied < lastIndex {
