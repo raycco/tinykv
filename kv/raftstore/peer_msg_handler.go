@@ -39,35 +39,63 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func (d *peerMsgHandler) processPut(put *raft_cmdpb.PutRequest, resp *raft_cmdpb.RaftCmdResponse) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) processPut(put *raft_cmdpb.PutRequest, resp *raft_cmdpb.RaftCmdResponse) {
 	err := d.peerStorage.WriteKV(put.Cf, put.Key, put.Value)
-	putrsp := &raft_cmdpb.PutResponse{}
-	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: putrsp})
-	log.Infof("[S%d] %+v process put key = %+v value = %+v", d.PeerId(), err, string(put.Key), string(put.Value))
-	return resp
+	if err != nil {
+		log.Errorf("[S%d] write kv failed: %v", d.PeerId(), err)
+		BindRespError(resp, err)
+		return
+	}
+
+	putRsp := &raft_cmdpb.PutResponse{}
+	resp.Responses = append(resp.Responses,
+		&raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Put,
+			Put:     putRsp,
+		})
+	log.Infof("[S%d] process put key = %+v value = %+v", d.PeerId(), string(put.Key), string(put.Value))
 }
 
-func (d *peerMsgHandler) processGet(get *raft_cmdpb.GetRequest, resp *raft_cmdpb.RaftCmdResponse) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) processGet(get *raft_cmdpb.GetRequest, resp *raft_cmdpb.RaftCmdResponse) {
 	value, err := d.peerStorage.ReadKV(get.Cf, get.Key)
-	getrsp := &raft_cmdpb.GetResponse{Value: value}
-	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: getrsp})
-	log.Infof("[S%d] %+v process get key = %+v value = %+v", d.PeerId(), err, string(get.Key), string(value))
-	return resp
+	if err != nil {
+		log.Errorf("[S%d] read kv failed: %v", d.PeerId(), err)
+		BindRespError(resp, err)
+		return
+	}
+	getRsp := &raft_cmdpb.GetResponse{Value: value}
+	resp.Responses = append(resp.Responses,
+		&raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Get,
+			Get:     getRsp,
+		})
+	log.Infof("[S%d] process get key = %+v value = %+v", d.PeerId(), string(get.Key), string(value))
 }
 
-func (d *peerMsgHandler) processSnap(snap *raft_cmdpb.SnapRequest, resp *raft_cmdpb.RaftCmdResponse) *raft_cmdpb.RaftCmdResponse {
-	snaprsp := &raft_cmdpb.SnapResponse{Region: d.peerStorage.Region()}
-	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: snaprsp})
-	log.Infof("[S%d] process snap %+v", d.PeerId(), resp)
-	return resp
+func (d *peerMsgHandler) processSnap(snap *raft_cmdpb.SnapRequest, resp *raft_cmdpb.RaftCmdResponse) {
+	snapRsp := &raft_cmdpb.SnapResponse{Region: d.peerStorage.Region()}
+	resp.Responses = append(resp.Responses,
+		&raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Snap,
+			Snap:    snapRsp,
+		})
+	log.Infof("[S%d] process snap", d.PeerId())
 }
 
-func (d *peerMsgHandler) processDelete(del *raft_cmdpb.DeleteRequest, resp *raft_cmdpb.RaftCmdResponse) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) processDelete(del *raft_cmdpb.DeleteRequest, resp *raft_cmdpb.RaftCmdResponse) {
 	err := d.peerStorage.DeleteKV(del.Cf, del.Key)
-	delrsp := &raft_cmdpb.DeleteResponse{}
-	resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: delrsp})
-	log.Infof("[S%d] %+v process delete %+v", d.PeerId(), err, resp)
-	return resp
+	if err != nil {
+		log.Errorf("[S%d] delete kv failed: %v", d.PeerId(), err)
+		BindRespError(resp, err)
+		return
+	}
+	delRsp := &raft_cmdpb.DeleteResponse{}
+	resp.Responses = append(resp.Responses,
+		&raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Delete,
+			Delete:  delRsp,
+		})
+	log.Infof("[S%d] process delete key = %+v", d.PeerId(), string(del.Key))
 }
 
 func (d *peerMsgHandler) process(entry eraftpb.Entry) {
@@ -80,13 +108,13 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 		for _, req := range msg.Requests {
 			switch req.CmdType {
 			case raft_cmdpb.CmdType_Put:
-				resp = d.processPut(req.Put, resp)
+				d.processPut(req.Put, resp)
 			case raft_cmdpb.CmdType_Delete:
-				resp = d.processDelete(req.Delete, resp)
+				d.processDelete(req.Delete, resp)
 			case raft_cmdpb.CmdType_Get:
-				resp = d.processGet(req.Get, resp)
+				d.processGet(req.Get, resp)
 			case raft_cmdpb.CmdType_Snap:
-				resp = d.processSnap(req.Snap, resp)
+				d.processSnap(req.Snap, resp)
 			}
 		}
 	}
@@ -95,14 +123,23 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 		return
 	}
 	log.Infof("[S%d] process entry = %+v", d.PeerId(), entry)
-	proposal := d.proposals[0]
-	log.Infof("[S%d] process entry proposal = %+v", d.PeerId(), proposal)
-	if entry.Index == proposal.index && entry.Term == proposal.term {
-		if resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
-			proposal.cb.Txn = d.peerStorage.SnapKV()
+	idx := -1
+	for i, proposal := range d.proposals {
+		if entry.Index == proposal.index && entry.Term == proposal.term {
+			if d.IsLeader() {
+				if resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+					proposal.cb.Txn = d.peerStorage.TransactionKV()
+				}
+				proposal.cb.Done(resp)
+				log.Infof("[S%d] process entry proposal = %+v", d.PeerId(), proposal)
+			}
+			idx = i
+			break
 		}
-		proposal.cb.Done(resp)
-		d.proposals = d.proposals[1:]
+	}
+
+	if idx != -1 {
+		d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
 	}
 }
 

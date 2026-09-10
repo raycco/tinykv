@@ -205,7 +205,6 @@ func newRaft(c *Config) *Raft {
 
 	raft.random = *NewRandomGenerator(c.ElectionTick)
 	raft.resetElectionTimeout()
-	log.New()
 
 	return raft
 }

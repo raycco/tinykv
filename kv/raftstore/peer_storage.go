@@ -380,6 +380,6 @@ func (ps *PeerStorage) DeleteKV(cf string, key []byte) error {
 	return err
 }
 
-func (ps *PeerStorage) SnapKV() *badger.Txn {
+func (ps *PeerStorage) TransactionKV() *badger.Txn {
 	return ps.Engines.Kv.NewTransaction(false)
 }
