@@ -343,14 +343,13 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	raftWB := new(engine_util.WriteBatch)
 	if len(ready.Entries) > 0 {
 		ps.Append(ready.Entries, raftWB)
+		ps.raftState.LastIndex = ready.Entries[len(ready.Entries)-1].Index
+		ps.raftState.LastTerm = ready.Entries[len(ready.Entries)-1].Term
 	}
 
-	//ps.raftState.LastIndex = ready.Entries[len(ready.Entries)-1].Index
-	//ps.raftState.LastTerm = ready.Entries[len(ready.Entries)-1].Term
 	ps.raftState.HardState = &ready.HardState
-	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-	ps.Engines.WriteRaft(raftWB)
-	return nil, nil
+	err := engine_util.PutMeta(ps.Engines.Raft, meta.RaftStateKey(ps.region.Id), ps.raftState)
+	return nil, err
 }
 
 func (ps *PeerStorage) ClearData() {

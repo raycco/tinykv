@@ -72,7 +72,6 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
-	ready Ready
 
 	logPrefix string
 }
@@ -150,14 +149,18 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	//softState := &SoftState{rn.Raft.Lead, rn.Raft.State}
-	//hardState, _, _ := rn.Raft.RaftLog.storage.InitialState()
 	log.Infof("%s ready: applied = %+v, committed = %+v, lastIndex = %+v",
 		rn.logPrefix, rn.Raft.RaftLog.applied, rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex())
 	entries := rn.Raft.RaftLog.unstableEntries()
 	commitedEnts := rn.Raft.RaftLog.nextEnts()
 	msgs := rn.Raft.msgs
-	return Ready{nil, pb.HardState{}, entries, pb.Snapshot{}, commitedEnts, msgs}
+	var hardState pb.HardState
+	if rn.HasReady() {
+		hardState = pb.HardState{Term: rn.Raft.Term, Vote: rn.Raft.Vote, Commit: rn.Raft.RaftLog.committed}
+	} else {
+		hardState = pb.HardState{}
+	}
+	return Ready{nil, hardState, entries, pb.Snapshot{}, commitedEnts, msgs}
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
