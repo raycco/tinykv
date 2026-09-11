@@ -199,7 +199,7 @@ func newRaft(c *Config) *Raft {
 		}
 	}
 
-	//raft.RaftLog.applied = c.Applied
+	raft.RaftLog.applied = c.Applied
 
 	raft.logPrefix = fmt.Sprintf("[S%d]", raft.id)
 
@@ -310,6 +310,7 @@ func (r *Raft) resetElectionTimeout() {
 
 func (r *Raft) startElection() {
 	log.Debugf("%s start election, peers: %+v", r.logPrefix, r.Prs)
+	r.votes = make(map[uint64]bool)
 	r.becomeCandidate()
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
@@ -519,7 +520,7 @@ func (r *Raft) searchConflictIndex(prevLogIndex uint64) uint64 {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	log.Debugf("%s handle append entries start: %+v", r.logPrefix, r.RaftLog.allEntries())
+	log.Debugf("%s handle append entries start: %+v", r.logPrefix, m.Entries)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		From:    r.id,
@@ -573,17 +574,27 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	log.Infof("%s handle append entries stabled %+v index %+v mid: %+v", r.logPrefix, r.RaftLog.stabled, index, entries)
-	if len(entries) > 0 {
-		if index <= r.RaftLog.stabled {
-			if entries[len(entries)-1].Index >= r.RaftLog.stabled {
-				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
-					storage.Append(entries[:r.RaftLog.stabled-entries[0].Index+1])
-					//r.RaftLog.storage.(*MemoryStorage).Append(entries[:r.RaftLog.stabled-entries[0].Index+1])
-					if entries[len(entries)-1].Index > r.RaftLog.stabled {
-						r.RaftLog.entries = append(r.RaftLog.entries, entries[r.RaftLog.stabled-entries[0].Index+1:]...)
-					}
-				}
 
+	if len(entries) > 0 {
+		stableIdx := r.RaftLog.stabled
+		if index <= stableIdx {
+			firstIdx, lastIdx := entries[0].Index, entries[len(entries)-1].Index
+			if firstIdx <= stableIdx && stableIdx <= lastIdx {
+				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
+					storage.Append(entries[:stableIdx-firstIdx+1])
+					//r.RaftLog.storage.(*MemoryStorage).Append(entries[:stableIdx-firstIdx+1])
+				} else {
+					if len(r.RaftLog.entries) > 0 {
+						// truncate log after conflict index
+						if stableIdx > r.RaftLog.entries[0].Index {
+							r.RaftLog.entries = r.RaftLog.entries[:stableIdx-r.RaftLog.entries[0].Index]
+						} else {
+							r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
+						}
+					}
+					r.RaftLog.entries = append(r.RaftLog.entries, entries[:stableIdx-firstIdx+1]...)
+				}
+				r.RaftLog.entries = append(r.RaftLog.entries, entries[stableIdx-firstIdx:]...)
 			} else {
 				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
 					storage.Append(entries)
@@ -594,6 +605,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			if len(r.RaftLog.entries) > 0 {
 				// truncate log after conflict index
 				r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
+				if conflict {
+					log.Infof("%s handle append entries after truncate index: %+v", r.logPrefix, r.RaftLog.entries)
+				}
 			}
 			r.RaftLog.entries = append(r.RaftLog.entries, entries...)
 		}
@@ -602,6 +616,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if conflict {
 		r.RaftLog.stabled = index - 1
 	}
+	log.Infof("%s handle append entries stabled: %+v", r.logPrefix, r.RaftLog.stabled)
 
 	var lastNewIndex uint64
 	if len(entries) == 0 {
@@ -610,9 +625,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		lastNewIndex = r.RaftLog.LastIndex()
 	}
 	r.Prs[r.id] = &Progress{lastNewIndex, lastNewIndex + 1}
-
-	//r.RaftLog.storage.(*MemoryStorage).Append(stableEnts)
-	//r.RaftLog.entries = append(r.RaftLog.entries, entries...)
 
 	log.Debugf("%s handle append entries end commit: %+v %+v", r.logPrefix, r.RaftLog.committed, r.RaftLog.allEntries())
 
@@ -628,10 +640,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		} else {
 			r.RaftLog.committed = lastNewIndex
 		}
-	}
-
-	if r.RaftLog.committed > r.RaftLog.stabled {
-		r.RaftLog.stabled = r.RaftLog.committed
 	}
 
 	r.apply()
@@ -655,7 +663,7 @@ func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 				r.Prs[m.From] = &Progress{m.Index, m.Index + 1}
 			}
 
-			log.Infof("%s handle append response progress: %+v commit: %d", r.logPrefix, r.Prs[m.From], r.RaftLog.committed)
+			log.Infof("%s handle append response progress: %+v commit: %d", r.logPrefix, r.Prs, r.RaftLog.committed)
 
 			count := 1
 			index := r.Prs[m.From].Match
@@ -670,9 +678,6 @@ func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 			term, _ := r.RaftLog.Term(index)
 			if count > len(r.Prs)/2 && term == r.Term {
 				r.RaftLog.committed = index
-				if r.RaftLog.committed > r.RaftLog.stabled {
-					r.RaftLog.stabled = r.RaftLog.committed
-				}
 				r.sendAppends()
 				r.apply()
 			}

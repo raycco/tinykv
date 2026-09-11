@@ -107,9 +107,8 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 
 	lastIndex, _ := l.storage.LastIndex()
 	var entries []pb.Entry
-	if l.stabled < lastIndex {
+	if l.stabled < lastIndex && len(l.entries) <= 0 {
 		entries, _ = l.storage.Entries(l.stabled+1, lastIndex+1)
-		entries = append(entries, l.entries...)
 	} else {
 		for _, entry := range l.entries {
 			if entry.Index > l.stabled {
@@ -118,9 +117,13 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		}
 	}
 
+	log.Debugf("get unstable entries: stabled = %+v, committed = %+v, storage lastIndex = %+v lastIndex = %+v entries %+v",
+		l.stabled, l.committed, lastIndex, l.LastIndex(), entries)
+
 	if len(entries) == 0 {
 		return []pb.Entry{}
 	}
+
 	return entries
 }
 
@@ -128,19 +131,21 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	lastIndex, _ := l.storage.LastIndex()
-	log.Debugf("get commited entries: applied = %+v, committed = %+v, storage lastIndex = %+v  lastIndex = %+v",
+	log.Debugf("get commited entries: applied = %+v, committed = %+v, storage lastIndex = %+v lastIndex = %+v",
 		l.applied, l.committed, lastIndex, l.LastIndex())
 	var entries []pb.Entry
+	applied := l.applied
 	if l.applied < lastIndex {
 		if lastIndex > l.committed {
 			entries, _ = l.storage.Entries(l.applied+1, l.committed+1)
+			applied = l.committed
 		} else {
 			entries, _ = l.storage.Entries(l.applied+1, lastIndex+1)
+			applied = lastIndex
 		}
 	}
-
 	for _, entry := range l.entries {
-		if entry.Index <= l.committed && entry.Index > l.applied {
+		if entry.Index <= l.committed && entry.Index > applied {
 			entries = append(entries, entry)
 		}
 	}
@@ -186,4 +191,19 @@ func (l *RaftLog) ArrIndex(i uint64) int {
 	}
 
 	return 0
+}
+
+func (l *RaftLog) Advance(idx uint64) {
+
+	if idx > l.applied {
+		l.applied = idx
+		l.stabled = idx
+	}
+
+	if len(l.entries) > 0 {
+		firstIdx := l.entries[0].Index
+		if l.stabled >= firstIdx {
+			l.entries = l.entries[l.stabled-firstIdx+1:]
+		}
+	}
 }

@@ -119,10 +119,12 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 		}
 	}
 
+	log.Infof("[S%d] process entry = %+v", d.PeerId(), entry)
+
 	if len(d.proposals) <= 0 {
 		return
 	}
-	log.Infof("[S%d] process entry = %+v", d.PeerId(), entry)
+
 	idx := -1
 	for i, proposal := range d.proposals {
 		if entry.Index == proposal.index && entry.Term == proposal.term {
@@ -151,7 +153,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
-		log.Infof("[S%d] %+v handle raft ready", d.PeerId(), len(ready.Messages))
+		log.Infof("[S%d] %+v handle ready entries: %+v commit entries: %+v",
+			d.PeerId(), len(ready.Messages), len(ready.Entries), len(ready.CommittedEntries))
 		d.peerStorage.SaveReadyState(&ready)
 		d.Send(d.ctx.trans, ready.Messages)
 		for _, entry := range ready.CommittedEntries {

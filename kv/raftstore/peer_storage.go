@@ -3,6 +3,7 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -309,15 +310,10 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
 	for _, entry := range entries {
-		if entry.Index <= ps.applyState.AppliedIndex {
-			continue
-		}
 		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
 	}
-
-	err := ps.Engines.WriteRaft(raftWB)
-
-	return err
+	//err := ps.Engines.WriteRaft(raftWB)
+	return nil
 }
 
 // Apply the peer with given snapshot
@@ -341,14 +337,25 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 	raftWB := new(engine_util.WriteBatch)
-	if len(ready.Entries) > 0 {
+	if len(ready.Entries) > 0 && !reflect.DeepEqual(ready.Entries, []eraftpb.Entry{}) {
+
 		ps.Append(ready.Entries, raftWB)
-		ps.raftState.LastIndex = ready.Entries[len(ready.Entries)-1].Index
-		ps.raftState.LastTerm = ready.Entries[len(ready.Entries)-1].Term
+
+		lastIdx := len(ready.Entries) - 1
+		ps.raftState.LastIndex = ready.Entries[lastIdx].Index
+		ps.raftState.LastTerm = ready.Entries[lastIdx].Term
+
+		/*ps.applyState.TruncatedState = &rspb.RaftTruncatedState{
+			Index: ready.Entries[0].Index,
+			Term:  ready.Entries[0].Term,
+		}
+		ps.applyState.AppliedIndex = ready.Entries[lastIdx].Index*/
 	}
 
 	ps.raftState.HardState = &ready.HardState
-	err := engine_util.PutMeta(ps.Engines.Raft, meta.RaftStateKey(ps.region.Id), ps.raftState)
+	//raftWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	err := ps.Engines.WriteRaft(raftWB)
 	return nil, err
 }
 

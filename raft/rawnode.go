@@ -178,9 +178,10 @@ func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 
 	if len(rd.CommittedEntries) > 0 {
-		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-		rn.Raft.RaftLog.stabled = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		idx := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		rn.Raft.RaftLog.Advance(idx)
 	}
+
 	rn.Raft.msgs = make([]pb.Message, 0)
 }
 
