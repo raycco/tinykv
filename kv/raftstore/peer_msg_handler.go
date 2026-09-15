@@ -117,6 +117,15 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 				d.processSnap(req.Snap, resp)
 			}
 		}
+		if msg.AdminRequest != nil {
+			switch msg.AdminRequest.CmdType {
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				term := msg.AdminRequest.CompactLog.CompactTerm
+				index := msg.AdminRequest.CompactLog.CompactIndex
+				d.peerStorage.UpdateTruncatedState(term, index)
+				d.ScheduleCompactLog(index)
+			}
+		}
 	}
 
 	log.Infof("[S%d] process entry = %+v", d.PeerId(), entry)

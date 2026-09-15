@@ -328,6 +328,23 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+
+	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+
+	ps.clearMeta(kvWB, raftWB)
+	ps.clearExtraData(ps.region)
+
+	ch := make(chan bool, 1)
+	ps.snapState.StateType = snap.SnapState_Applying
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: ps.region.GetStartKey(),
+		EndKey:   ps.region.GetEndKey(),
+	}
 	return nil, nil
 }
 
@@ -345,17 +362,19 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		ps.raftState.LastIndex = ready.Entries[lastIdx].Index
 		ps.raftState.LastTerm = ready.Entries[lastIdx].Term
 
-		/*ps.applyState.TruncatedState = &rspb.RaftTruncatedState{
-			Index: ready.Entries[0].Index,
-			Term:  ready.Entries[0].Term,
-		}
-		ps.applyState.AppliedIndex = ready.Entries[lastIdx].Index*/
+		//ps.applyState.AppliedIndex = ready.Entries[lastIdx].Index
+	}
+
+	if ready.Snapshot.Metadata.Index > 1 {
+		kvWB := new(engine_util.WriteBatch)
+		ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		ps.Engines.WriteKV(kvWB)
 	}
 
 	ps.raftState.HardState = &ready.HardState
-	//raftWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	err := ps.Engines.WriteRaft(raftWB)
+
 	return nil, err
 }
 
@@ -388,4 +407,9 @@ func (ps *PeerStorage) DeleteKV(cf string, key []byte) error {
 
 func (ps *PeerStorage) TransactionKV() *badger.Txn {
 	return ps.Engines.Kv.NewTransaction(false)
+}
+
+func (ps *PeerStorage) UpdateTruncatedState(term, index uint64) {
+	ps.applyState.TruncatedState.Term = term
+	ps.applyState.TruncatedState.Index = index
 }

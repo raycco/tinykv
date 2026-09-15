@@ -155,12 +155,15 @@ func (rn *RawNode) Ready() Ready {
 	commitedEnts := rn.Raft.RaftLog.nextEnts()
 	msgs := rn.Raft.msgs
 	var hardState pb.HardState
+	var snapshot pb.Snapshot
 	if rn.HasReady() {
 		hardState = pb.HardState{Term: rn.Raft.Term, Vote: rn.Raft.Vote, Commit: rn.Raft.RaftLog.committed}
+		snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	} else {
 		hardState = pb.HardState{}
+		snapshot = pb.Snapshot{}
 	}
-	return Ready{nil, hardState, entries, pb.Snapshot{}, commitedEnts, msgs}
+	return Ready{nil, hardState, entries, snapshot, commitedEnts, msgs}
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.

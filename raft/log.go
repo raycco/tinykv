@@ -15,6 +15,8 @@
 package raft
 
 import (
+	"sort"
+
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -61,8 +63,13 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	stabled, _ := storage.LastIndex()
 	hardState, _, _ := storage.InitialState()
-	//snap, _ := storage.Snapshot()
-	return &RaftLog{storage: storage, applied: 0, committed: hardState.Commit, stabled: stabled}
+	return &RaftLog{
+		storage:         storage,
+		applied:         0,
+		committed:       hardState.Commit,
+		stabled:         stabled,
+		pendingSnapshot: &pb.Snapshot{Metadata: &pb.SnapshotMetadata{ConfState: &pb.ConfState{}}},
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -81,21 +88,11 @@ func (l *RaftLog) allEntries() []pb.Entry {
 	lastIndex, _ := l.storage.LastIndex()
 	entries, _ := l.storage.Entries(firstIndex, lastIndex+1)
 	log.Debugf("all entries storage %+v memory %+v", entries, l.entries)
-	m := make(map[string]pb.Entry)
-	var result []pb.Entry
-	for _, p := range entries {
-		if _, ok := m[p.String()]; !ok {
-			m[p.String()] = p
-			result = append(result, p)
-		}
-	}
-	for _, p := range l.entries {
-		if _, ok := m[p.String()]; !ok {
-			m[p.String()] = p
-			result = append(result, p)
-		}
-	}
-	return result
+	entries = append(entries, l.entries...)
+
+	ents := l.trimEnts(entries)
+
+	return ents
 }
 
 // unstableEntries return all the unstable entries
@@ -131,26 +128,26 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	lastIndex, _ := l.storage.LastIndex()
-	log.Debugf("get commited entries: applied = %+v, committed = %+v, storage lastIndex = %+v lastIndex = %+v",
-		l.applied, l.committed, lastIndex, l.LastIndex())
 	var entries []pb.Entry
-	applied := l.applied
 	if l.applied < lastIndex {
 		if lastIndex > l.committed {
 			entries, _ = l.storage.Entries(l.applied+1, l.committed+1)
-			applied = l.committed
 		} else {
 			entries, _ = l.storage.Entries(l.applied+1, lastIndex+1)
-			applied = lastIndex
 		}
 	}
 	for _, entry := range l.entries {
-		if entry.Index <= l.committed && entry.Index > applied {
+		if entry.Index <= l.committed && entry.Index > l.applied {
 			entries = append(entries, entry)
 		}
 	}
 
-	return entries
+	ents = l.trimEnts(entries)
+
+	log.Debugf("next ents applied = %+v, committed = %+v, storage lastIndex = %+v memory lastIndex = %+v ents = %+v",
+		l.applied, l.committed, lastIndex, l.LastIndex(), ents)
+
+	return ents
 }
 
 // LastIndex return the last index of the log entries
@@ -161,6 +158,9 @@ func (l *RaftLog) LastIndex() uint64 {
 		lastIndex = l.entries[len(l.entries)-1].Index
 	} else {
 		lastIndex, _ = l.storage.LastIndex()
+		if lastIndex == 0 {
+			lastIndex = l.pendingSnapshot.Metadata.Index
+		}
 	}
 	return lastIndex
 }
@@ -168,6 +168,10 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
+	if i <= l.pendingSnapshot.Metadata.Index {
+		return l.pendingSnapshot.Metadata.Term, nil
+	}
+
 	lastIndex, _ := l.storage.LastIndex()
 	if i <= lastIndex {
 		return l.storage.Term(i)
@@ -206,4 +210,24 @@ func (l *RaftLog) Advance(idx uint64) {
 			l.entries = l.entries[l.stabled-firstIdx+1:]
 		}
 	}
+}
+
+func (l *RaftLog) trimEnts(entries []pb.Entry) (ents []pb.Entry) {
+	mapIdxEntry := make(map[uint64]pb.Entry)
+	for _, entry := range entries {
+		mapIdxEntry[entry.Index] = entry
+	}
+
+	var idxs []uint64
+	for idx := range mapIdxEntry {
+		idxs = append(idxs, idx)
+	}
+	sort.Slice(idxs, func(i, j int) bool {
+		return idxs[i] < idxs[j]
+	})
+
+	for _, idx := range idxs {
+		ents = append(ents, mapIdxEntry[idx])
+	}
+	return ents
 }

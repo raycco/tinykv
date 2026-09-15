@@ -200,6 +200,10 @@ func newRaft(c *Config) *Raft {
 	}
 
 	raft.RaftLog.applied = c.Applied
+	snap, err := c.Storage.Snapshot()
+	if err == nil && raft.RaftLog.applied < snap.Metadata.Index {
+		raft.RaftLog.applied = snap.Metadata.Index
+	}
 
 	raft.logPrefix = fmt.Sprintf("[S%d]", raft.id)
 
@@ -218,12 +222,7 @@ func (r *Raft) sendAppends() {
 	r.resetElectionTimeout()
 }
 
-// sendAppend sends an append RPC with new entries (if any) and the
-// current commit index to the given peer. Returns true if a message was sent.
-func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
-
-	prevLogIndex := r.Prs[to].Next - 1
+func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 
 	log.Infof("%s send append prevLogIndex: %+v, prevLogTerm: %+v, stable: %+v",
@@ -262,6 +261,47 @@ func (r *Raft) sendAppend(to uint64) bool {
 		matchIndex := msg.Entries[len(msg.Entries)-1].Index
 		r.Prs[r.id] = &Progress{matchIndex, matchIndex + 1}
 		log.Infof("%s send append progress: %+v ", r.logPrefix, r.Prs[r.id])
+	}
+	return msg
+}
+
+func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
+	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	snapshot, _ := r.RaftLog.storage.Snapshot()
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		LogTerm:  prevLogTerm,
+		Index:    prevLogIndex,
+		Commit:   r.RaftLog.committed,
+		Snapshot: &snapshot,
+	}
+
+	r.Prs[to] = &Progress{snapshot.Metadata.Index, snapshot.Metadata.Index + 1}
+
+	log.Infof("%s send snapshot LII: %+v, push msg: %+v", r.logPrefix, r.RaftLog.LastIndex(), msg)
+
+	return msg
+}
+
+// sendAppend sends an append RPC with new entries (if any) and the
+// current commit index to the given peer. Returns true if a message was sent.
+func (r *Raft) sendAppend(to uint64) bool {
+	// Your Code Here (2A).
+
+	prevLogIndex := r.Prs[to].Next - 1
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	var msg pb.Message
+	if err == nil {
+		if prevLogIndex >= snapshot.Metadata.Index {
+			msg = r.buildAppend(prevLogIndex, to)
+		} else {
+			msg = r.buildSnapshot(prevLogIndex, to)
+		}
+	} else {
+		msg = r.buildAppend(prevLogIndex, to)
 	}
 
 	r.msgs = append(r.msgs, msg)
@@ -447,6 +487,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 			r.becomeFollower(m.Term, r.Lead)
 		}
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -663,7 +705,8 @@ func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 				r.Prs[m.From] = &Progress{m.Index, m.Index + 1}
 			}
 
-			log.Infof("%s handle append response progress: %+v commit: %d", r.logPrefix, r.Prs, r.RaftLog.committed)
+			log.Infof("%s handle append response progress from %+v: %+v commit: %d",
+				r.logPrefix, m.From, r.Prs[m.From], r.RaftLog.committed)
 
 			count := 1
 			index := r.Prs[m.From].Match
@@ -823,6 +866,29 @@ func (r *Raft) handleHeartbeatRsp(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if r.Term > m.Term {
+		return
+	}
+
+	if m.Snapshot.Metadata.Index < r.RaftLog.committed {
+		return
+	}
+
+	r.becomeFollower(m.Term, m.From)
+
+	r.RaftLog.pendingSnapshot = m.GetSnapshot()
+	r.RaftLog.committed = r.RaftLog.pendingSnapshot.Metadata.Index
+
+	if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
+		storage.ApplySnapshot(*r.RaftLog.pendingSnapshot)
+	}
+
+	if len(m.Snapshot.Metadata.ConfState.Nodes) > 0 {
+		r.Prs = make(map[uint64]*Progress)
+		for _, peer := range m.Snapshot.Metadata.ConfState.Nodes {
+			r.Prs[peer] = &Progress{r.RaftLog.committed, r.RaftLog.committed + 1}
+		}
+	}
 }
 
 // addNode add a new node to raft group
