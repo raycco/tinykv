@@ -349,6 +349,9 @@ func (r *Raft) resetElectionTimeout() {
 }
 
 func (r *Raft) startElection() {
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	log.Debugf("%s start election, peers: %+v", r.logPrefix, r.Prs)
 	r.votes = make(map[uint64]bool)
 	r.becomeCandidate()
@@ -399,6 +402,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Term = term
 	r.Vote = 0
 	r.Lead = lead
+	r.leadTransferee = 0
 	r.votes = make(map[uint64]bool)
 }
 
@@ -451,6 +455,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.handleAppendEntriesRsp(m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatRsp(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 	return nil
 }
@@ -489,6 +495,10 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTimeoutNow:
+		r.startElection()
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 	return nil
 }
@@ -527,18 +537,26 @@ func (r *Raft) startNoop() {
 func (r *Raft) startOps(entries []*pb.Entry) {
 	for _, pEntry := range entries {
 		if pEntry != nil {
-			entry := pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term, Data: pEntry.Data}
+			entry := pb.Entry{
+				EntryType: pEntry.EntryType,
+				Index:     r.RaftLog.LastIndex() + 1,
+				Term:      r.Term,
+				Data:      pEntry.Data,
+			}
 			r.RaftLog.entries = append(r.RaftLog.entries, entry)
 		}
 	}
 }
 
 func (r *Raft) handlePropose(m pb.Message) {
+	if r.leadTransferee != 0 {
+		return
+	}
 	r.startOps(m.Entries)
 	log.Debugf("%s handle propose LII: %+v, entries: %+v", r.logPrefix, r.RaftLog.LastIndex(), r.RaftLog.allEntries())
 	if len(r.Prs) == 1 {
 		r.RaftLog.committed = r.RaftLog.LastIndex()
-		r.apply()
+		//r.apply()
 		return
 	}
 	r.sendAppends()
@@ -724,6 +742,11 @@ func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 				r.sendAppends()
 				r.apply()
 			}
+
+			if r.leadTransferee != 0 {
+				r.sendTimeoutNow(m.From)
+			}
+
 		}
 	}
 }
@@ -894,9 +917,67 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.Prs[id] = &Progress{r.RaftLog.committed, r.RaftLog.committed + 1}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		return
+	}
+	delete(r.Prs, id)
+	if len(r.Prs) <= 0 {
+		return
+	}
+	count := 1
+	index := r.Prs[r.id].Match
+	for peer, prs := range r.Prs {
+		if peer != r.id && prs.Match > r.RaftLog.committed {
+			count++
+			if prs.Match < index { // the min index for commit
+				index = prs.Match
+			}
+		}
+	}
+	term, _ := r.RaftLog.Term(index)
+	if count > len(r.Prs)/2 && term == r.Term {
+		r.RaftLog.committed = index
+		r.apply()
+	}
+}
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	if r.State == StateLeader {
+		if m.From <= 0 {
+			return
+		}
+
+		if _, ok := r.Prs[m.From]; !ok {
+			return
+		}
+
+		r.leadTransferee = m.From
+		r.sendTimeoutNow(m.From)
+	} else {
+		m.To = r.Lead
+		r.msgs = append(r.msgs, m)
+	}
+}
+
+func (r *Raft) sendTimeoutNow(to uint64) {
+	if r.Prs[to].Next < r.RaftLog.LastIndex() ||
+		r.Prs[to].Match < r.RaftLog.committed {
+		r.sendAppend(to)
+		return
+	}
+
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+	}
+
+	r.msgs = append(r.msgs, msg)
 }

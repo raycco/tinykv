@@ -163,7 +163,13 @@ func (rn *RawNode) Ready() Ready {
 		hardState = pb.HardState{}
 		snapshot = pb.Snapshot{}
 	}
-	return Ready{nil, hardState, entries, snapshot, commitedEnts, msgs}
+
+	var softState *SoftState
+	if rn.Raft.Lead != 0 {
+		softState = &SoftState{rn.Raft.Lead, rn.Raft.State}
+	}
+
+	return Ready{softState, hardState, entries, snapshot, commitedEnts, msgs}
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
