@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -200,9 +201,9 @@ func newRaft(c *Config) *Raft {
 	}
 
 	raft.RaftLog.applied = c.Applied
-	snap, err := c.Storage.Snapshot()
-	if err == nil && raft.RaftLog.applied < snap.Metadata.Index {
-		raft.RaftLog.applied = snap.Metadata.Index
+	firstIdx, _ := c.Storage.FirstIndex()
+	if raft.RaftLog.applied < firstIdx {
+		raft.RaftLog.applied = firstIdx - 1
 	}
 
 	raft.logPrefix = fmt.Sprintf("[S%d]", raft.id)
@@ -225,10 +226,10 @@ func (r *Raft) sendAppends() {
 func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 
-	log.Infof("%s send append prevLogIndex: %+v, prevLogTerm: %+v, stable: %+v",
-		r.logPrefix, prevLogIndex, prevLogTerm, r.RaftLog.stabled)
+	log.Infof("%s send append to [S%d] prevLogIndex: %+v, prevLogTerm: %+v, stable: %+v",
+		r.logPrefix, to, prevLogIndex, prevLogTerm, r.RaftLog.stabled)
 
-	log.Debugf("%s send append entries: %+v", r.logPrefix, r.RaftLog.allEntries())
+	log.Debugf("%s send append to [S%d] entries: %+v", r.logPrefix, to, r.RaftLog.allEntries())
 
 	//entries := make([]pb.Entry, r.RaftLog.LastIndex()-prevLogIndex)
 	var entries []pb.Entry
@@ -239,7 +240,7 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	}
 	//copy(entries, r.RaftLog.allEntries()[nextArrIndex:])
 
-	log.Infof("%s send append LII: %+v, push entries: %+v", r.logPrefix, r.RaftLog.LastIndex(), entries)
+	log.Infof("%s send append to [S%d] LII: %+v, push entries: %+v", r.logPrefix, to, r.RaftLog.LastIndex(), entries)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		From:    r.id,
@@ -255,7 +256,7 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 		msg.Entries = append(msg.Entries, &entryCopy)
 	}
 
-	log.Infof("%s send append LII: %+v, push msg: %+v", r.logPrefix, r.RaftLog.LastIndex(), msg)
+	log.Infof("%s send append to [S%d] LII: %+v, push msg: %+v", r.logPrefix, to, r.RaftLog.LastIndex(), msg)
 
 	if len(msg.Entries) > 0 {
 		matchIndex := msg.Entries[len(msg.Entries)-1].Index
@@ -265,9 +266,8 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	return msg
 }
 
-func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
+func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64, snapshot *pb.Snapshot) pb.Message {
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
-	snapshot, _ := r.RaftLog.storage.Snapshot()
 	msg := pb.Message{
 		MsgType:  pb.MessageType_MsgSnapshot,
 		From:     r.id,
@@ -276,12 +276,12 @@ func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
 		LogTerm:  prevLogTerm,
 		Index:    prevLogIndex,
 		Commit:   r.RaftLog.committed,
-		Snapshot: &snapshot,
+		Snapshot: snapshot,
 	}
 
 	r.Prs[to] = &Progress{snapshot.Metadata.Index, snapshot.Metadata.Index + 1}
 
-	log.Infof("%s send snapshot LII: %+v, push msg: %+v", r.logPrefix, r.RaftLog.LastIndex(), msg)
+	log.Infof("%s send snapshot to [S%d] LII: %+v, push msg: %+v", r.logPrefix, to, r.RaftLog.LastIndex(), msg)
 
 	return msg
 }
@@ -291,14 +291,24 @@ func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 
-	prevLogIndex := r.Prs[to].Next - 1
-	snapshot, err := r.RaftLog.storage.Snapshot()
 	var msg pb.Message
-	if err == nil {
-		if prevLogIndex >= snapshot.Metadata.Index {
-			msg = r.buildAppend(prevLogIndex, to)
-		} else {
-			msg = r.buildSnapshot(prevLogIndex, to)
+	prevLogIndex := r.Prs[to].Next - 1
+	firstIdx, _ := r.RaftLog.storage.FirstIndex()
+	if r.Prs[to].Next < firstIdx {
+		for {
+			snapshot, err := r.RaftLog.storage.Snapshot()
+			log.Infof("%s request snapshot to [S%d] snapshot %+v err: %+v", r.logPrefix, to, snapshot, err)
+			if err == ErrSnapshotTemporarilyUnavailable {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			} else {
+				if err == nil {
+					msg = r.buildSnapshot(prevLogIndex, to, &snapshot)
+				} else {
+					msg = r.buildAppend(prevLogIndex, to)
+				}
+				break
+			}
 		}
 	} else {
 		msg = r.buildAppend(prevLogIndex, to)
@@ -311,7 +321,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	log.Infof("%s send heartbeat to %+v match %+v leader match %+v", r.logPrefix, to, r.Prs[to], r.Prs[r.id])
+	log.Infof("%s send heartbeat to [S%+v] match %+v leader match %+v", r.logPrefix, to, r.Prs[to], r.Prs[r.id])
 	//term, _ := r.RaftLog.Term(r.Prs[r.id].Match)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
@@ -340,7 +350,7 @@ func (r *Raft) sendRequestVote(to uint64) {
 	}
 
 	r.msgs = append(r.msgs, msg)
-	log.Infof("%s send request vote to %+v msg %+v", r.logPrefix, to, msg)
+	log.Infof("%s send request vote to [S%+v] msg %+v", r.logPrefix, to, msg)
 }
 
 func (r *Raft) resetElectionTimeout() {
@@ -580,7 +590,7 @@ func (r *Raft) searchConflictIndex(prevLogIndex uint64) uint64 {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	log.Debugf("%s handle append entries start: %+v", r.logPrefix, m.Entries)
+	log.Debugf("%s handle append entries start: %+v", r.logPrefix, r.RaftLog.allEntries())
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		From:    r.id,
@@ -599,12 +609,16 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.becomeFollower(m.Term, m.From)
 
 	term, _ := r.RaftLog.Term(m.Index)
+	firstIdx, _ := r.RaftLog.storage.FirstIndex()
 	log.Infof("%s handle append entry m.Index: %+v m.LogTerm: %d, lastindex: %+v term %+v",
 		r.logPrefix, m.Index, m.LogTerm, r.RaftLog.LastIndex(), term)
 	if r.RaftLog.LastIndex() < m.Index || term != m.LogTerm {
 		msg.Reject = true
 		if r.RaftLog.LastIndex() < m.Index || m.Index == 0 {
 			msg.Index = r.RaftLog.LastIndex() + 1
+		} else if m.Index < firstIdx {
+			// m.Index: 291 m.LogTerm: 18, lastindex: 319 term 0
+			msg.Index = r.RaftLog.committed
 		} else {
 			msg.Index = r.searchConflictIndex(m.Index)
 		}
@@ -648,7 +662,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 						// truncate log after conflict index
 						if stableIdx > r.RaftLog.entries[0].Index {
 							r.RaftLog.entries = r.RaftLog.entries[:stableIdx-r.RaftLog.entries[0].Index]
-						} else {
+						} else if index > r.RaftLog.entries[0].Index {
 							r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
 						}
 					}
@@ -660,11 +674,16 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 					storage.Append(entries)
 					//r.RaftLog.storage.(*MemoryStorage).Append(entries)
 				}
+				r.RaftLog.entries = append(r.RaftLog.entries, entries...)
 			}
 		} else {
-			if len(r.RaftLog.entries) > 0 {
+			if len(r.RaftLog.entries) > 0 && index > r.RaftLog.entries[0].Index {
 				// truncate log after conflict index
-				r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
+				if index-r.RaftLog.entries[0].Index > uint64(len(r.RaftLog.entries)) {
+					r.RaftLog.entries = r.RaftLog.entries[:0]
+				} else {
+					r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
+				}
 				if conflict {
 					log.Infof("%s handle append entries after truncate index: %+v", r.logPrefix, r.RaftLog.entries)
 				}
@@ -893,14 +912,18 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		return
 	}
 
-	if m.Snapshot.Metadata.Index < r.RaftLog.committed {
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) ||
+		m.Snapshot.Metadata.Index <= r.RaftLog.committed {
 		return
 	}
 
 	r.becomeFollower(m.Term, m.From)
 
 	r.RaftLog.pendingSnapshot = m.GetSnapshot()
+	log.Infof("%s handle snapshot: %+v", r.logPrefix, *r.RaftLog.pendingSnapshot)
 	r.RaftLog.committed = r.RaftLog.pendingSnapshot.Metadata.Index
+	r.RaftLog.applied = r.RaftLog.committed
+	r.RaftLog.stabled = r.RaftLog.committed
 
 	if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
 		storage.ApplySnapshot(*r.RaftLog.pendingSnapshot)

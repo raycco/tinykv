@@ -68,7 +68,7 @@ func newLog(storage Storage) *RaftLog {
 		applied:         0,
 		committed:       hardState.Commit,
 		stabled:         stabled,
-		pendingSnapshot: &pb.Snapshot{Metadata: &pb.SnapshotMetadata{ConfState: &pb.ConfState{}}},
+		pendingSnapshot: nil,
 	}
 }
 
@@ -158,7 +158,7 @@ func (l *RaftLog) LastIndex() uint64 {
 		lastIndex = l.entries[len(l.entries)-1].Index
 	} else {
 		lastIndex, _ = l.storage.LastIndex()
-		if lastIndex == 0 {
+		if lastIndex == 0 && l.pendingSnapshot != nil {
 			lastIndex = l.pendingSnapshot.Metadata.Index
 		}
 	}
@@ -168,7 +168,7 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if i <= l.pendingSnapshot.Metadata.Index {
+	if l.pendingSnapshot != nil && i <= l.pendingSnapshot.Metadata.Index {
 		return l.pendingSnapshot.Metadata.Term, nil
 	}
 
@@ -197,15 +197,26 @@ func (l *RaftLog) ArrIndex(i uint64) int {
 	return 0
 }
 
-func (l *RaftLog) Advance(idx uint64) {
+func (l *RaftLog) AdvanceApplied(applied uint64) {
+	if applied > l.applied {
+		l.applied = applied
+	}
+}
 
-	if idx > l.applied {
-		l.applied = idx
-		l.stabled = idx
+func (l *RaftLog) AdvanceStabled(stabled uint64) {
+
+	if stabled > l.stabled {
+		l.stabled = stabled
 	}
 
 	if len(l.entries) > 0 {
 		firstIdx := l.entries[0].Index
+		lastIdx := l.entries[len(l.entries)-1].Index
+		if l.stabled >= lastIdx {
+			l.entries = l.entries[:0]
+			return
+		}
+
 		if l.stabled >= firstIdx {
 			l.entries = l.entries[l.stabled-firstIdx+1:]
 		}

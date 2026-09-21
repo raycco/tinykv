@@ -122,13 +122,18 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 			case raft_cmdpb.AdminCmdType_CompactLog:
 				term := msg.AdminRequest.CompactLog.CompactTerm
 				index := msg.AdminRequest.CompactLog.CompactIndex
-				d.peerStorage.UpdateTruncatedState(term, index)
-				d.ScheduleCompactLog(index)
+				log.Infof("[S%d] schedule compact log, CompactIndex %+v, LastCompactedIdx %+v TruncatedIndex %+v",
+					d.PeerId(), index, d.LastCompactedIdx, d.peerStorage.truncatedIndex())
+				if index > d.peerStorage.truncatedIndex() {
+					d.peerStorage.UpdateTruncatedState(term, index)
+					d.ScheduleCompactLog(index)
+				}
 			}
 		}
 	}
 
 	log.Infof("[S%d] process entry = %+v", d.PeerId(), entry)
+	d.peerStorage.UpdateAppliedIndex(entry.Index)
 
 	if len(d.proposals) <= 0 {
 		return
@@ -138,7 +143,7 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 	for i, proposal := range d.proposals {
 		if entry.Index == proposal.index && entry.Term == proposal.term {
 			if d.IsLeader() {
-				if resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+				if len(resp.Responses) > 0 && resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
 					proposal.cb.Txn = d.peerStorage.TransactionKV()
 				}
 				proposal.cb.Done(resp)
