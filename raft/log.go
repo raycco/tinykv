@@ -201,12 +201,22 @@ func (l *RaftLog) AdvanceApplied(applied uint64) {
 	if applied > l.applied {
 		l.applied = applied
 	}
+
+	if l.applied > l.committed {
+		l.applied = l.committed
+	}
 }
 
 func (l *RaftLog) AdvanceStabled(stabled uint64) {
 
 	if stabled > l.stabled {
 		l.stabled = stabled
+	}
+
+	// snap与append乱序可能导致stabled > storage.LastIndex()
+	lastIdx, _ := l.storage.LastIndex()
+	if l.stabled > lastIdx {
+		l.stabled = lastIdx
 	}
 
 	if len(l.entries) > 0 {

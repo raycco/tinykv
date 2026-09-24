@@ -17,8 +17,10 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -80,7 +82,7 @@ type RawNode struct {
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
 	rawNode := &RawNode{Raft: newRaft(config)}
-	rawNode.logPrefix = fmt.Sprintf("[N%d]", rawNode.Raft.id)
+	rawNode.logPrefix = fmt.Sprintf("[S%d]", rawNode.Raft.id)
 	return rawNode, nil
 }
 
@@ -191,17 +193,27 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 
+	// 当前storage日志219到228，applied = 223，收到snap = 224，收到append
+	// 的commit = 228，append index 229与230，memory = 230，日志变成219到230
+	// 先应用snap，storage = 224，清空storage中的日志，然后process，最后advance
+	// applied = 224, commit = 228, snap = 224, storage = 224, memory = 230
+	// 注：此时应用snap只应该删除225之前的日志，而非删除当前storage中所有日志
 	var applied, stabled uint64
+	firstIdx, _ := rn.Raft.RaftLog.storage.FirstIndex()
+	if !IsEmptySnap(&rd.Snapshot) && firstIdx > 0 && rd.Snapshot.Metadata.Index > firstIdx-1 {
+		applied = rd.Snapshot.Metadata.Index
+		stabled = rd.Snapshot.Metadata.Index
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	} else if len(rd.Entries) > 0 && !reflect.DeepEqual(rd.Entries, []eraftpb.Entry{}) {
+		stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+
 	if len(rd.CommittedEntries) > 0 {
 		applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 
-	if len(rd.Entries) > 0 {
-		stabled = rd.Entries[len(rd.Entries)-1].Index
-	} else if !IsEmptySnap(&rd.Snapshot) {
-		applied = rd.Snapshot.Metadata.Index
-		stabled = rd.Snapshot.Metadata.Index
-		rn.Raft.RaftLog.pendingSnapshot = nil
+	if stabled < applied {
+		stabled = applied
 	}
 
 	rn.Raft.RaftLog.AdvanceApplied(applied)

@@ -98,12 +98,37 @@ func (d *peerMsgHandler) processDelete(del *raft_cmdpb.DeleteRequest, resp *raft
 	log.Infof("[S%d] process delete key = %+v", d.PeerId(), string(del.Key))
 }
 
-func (d *peerMsgHandler) process(entry eraftpb.Entry) {
+func (d *peerMsgHandler) handleProposals(index, term uint64, resp *raft_cmdpb.RaftCmdResponse) {
+	if len(d.proposals) <= 0 {
+		return
+	}
+
+	idx := -1
+	for i, proposal := range d.proposals {
+		if index == proposal.index && term == proposal.term {
+			if d.IsLeader() {
+				if len(resp.Responses) > 0 && resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+					proposal.cb.Txn = d.peerStorage.TransactionKV()
+				}
+				proposal.cb.Done(resp)
+				log.Infof("[S%d] process entry proposal = %+v", d.PeerId(), proposal)
+			}
+			idx = i
+			break
+		}
+	}
+
+	if idx != -1 {
+		d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
+	}
+}
+
+func (d *peerMsgHandler) processNormal(entry eraftpb.Entry) {
 	resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
 	var msg raft_cmdpb.RaftCmdRequest
 	err := msg.Unmarshal(entry.Data)
 	if err != nil {
-		log.Infof("[S%d] %+v MarshalTo error", d.PeerId(), err)
+		log.Infof("[S%d] %+v Unmarshal RaftCmdRequest error", d.PeerId(), err)
 	} else {
 		for _, req := range msg.Requests {
 			switch req.CmdType {
@@ -139,23 +164,52 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry) {
 		return
 	}
 
-	idx := -1
-	for i, proposal := range d.proposals {
-		if entry.Index == proposal.index && entry.Term == proposal.term {
-			if d.IsLeader() {
-				if len(resp.Responses) > 0 && resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
-					proposal.cb.Txn = d.peerStorage.TransactionKV()
-				}
-				proposal.cb.Done(resp)
-				log.Infof("[S%d] process entry proposal = %+v", d.PeerId(), proposal)
+	d.handleProposals(entry.Index, entry.Term, resp)
+}
+
+func (d *peerMsgHandler) processConfChange(entry eraftpb.Entry) {
+	resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+	var cc eraftpb.ConfChange
+	err := cc.Unmarshal(entry.Data)
+	if err != nil {
+		log.Infof("[S%d] %+v Unmarshal ConfChange error", d.PeerId(), err)
+	} else {
+		log.Infof("[S%d] apply config change = %+v", d.PeerId(), cc)
+		exist := d.peerStorage.UpdateRegionState(cc)
+		if exist {
+			meta := d.ctx.storeMeta
+			//meta.Lock()
+			//defer meta.Unlock()
+			meta.regionRanges.ReplaceOrInsert(&regionItem{region: d.peerStorage.region})
+			meta.regions[d.peerStorage.region.Id] = d.peerStorage.region
+
+			d.RaftGroup.ApplyConfChange(cc)
+
+			if cc.ChangeType == eraftpb.ConfChangeType_RemoveNode {
+				d.removePeerCache(cc.NodeId)
 			}
-			idx = i
-			break
+
+			if cc.ChangeType == eraftpb.ConfChangeType_RemoveNode && cc.NodeId == d.PeerId() {
+				if d.MaybeDestroy() {
+					d.destroyPeer()
+				}
+			} else {
+				d.peerStorage.UpdateAppliedIndex(entry.Index)
+			}
 		}
 	}
 
-	if idx != -1 {
-		d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
+	d.handleProposals(entry.Index, entry.Term, resp)
+}
+
+func (d *peerMsgHandler) process(entry eraftpb.Entry) {
+	if d.stopped {
+		return
+	}
+	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		d.processConfChange(entry)
+	} else {
+		d.processNormal(entry)
 	}
 }
 
@@ -164,12 +218,24 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
-
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
 		log.Infof("[S%d] %+v handle ready entries: %+v commit entries: %+v",
 			d.PeerId(), len(ready.Messages), len(ready.Entries), len(ready.CommittedEntries))
-		d.peerStorage.SaveReadyState(&ready)
+		applyResult, err := d.peerStorage.SaveReadyState(&ready)
+		if err == nil && applyResult != nil {
+			// conf change刚好在snap中，需要更新region
+			meta := d.ctx.storeMeta
+			meta.Lock()
+			defer meta.Unlock()
+			newRegion := applyResult.Region
+			oldRegion := meta.regions[newRegion.Id]
+			if !util.RegionEqual(oldRegion, newRegion) {
+				log.Infof("[S%d] apply snapshot result: %+v", d.PeerId(), applyResult)
+				meta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+				meta.regions[newRegion.Id] = newRegion
+			}
+		}
 		d.Send(d.ctx.trans, ready.Messages)
 		for _, entry := range ready.CommittedEntries {
 			d.process(entry)
@@ -247,16 +313,55 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	log.Infof("[S%d] proposeRaftCommand %+v", d.PeerId(), msg)
-	// 将整个请求序列化为字节流
-	data, err := msg.Marshal()
-	if err != nil {
-		cb.Done(ErrResp(err))
-		return
-	}
-
+	log.Infof("[S%d] propose raft command %+v", d.PeerId(), msg)
 	// 提交至 Raft 组
-	if d.IsLeader() {
+	if msg.AdminRequest != nil {
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			{
+				data, err := msg.Marshal()
+				if err != nil {
+					return
+				}
+
+				if err := d.RaftGroup.Propose(data); err != nil {
+					return
+				}
+			}
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			{
+				d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+				resp := &raft_cmdpb.RaftCmdResponse{
+					Header:        &raft_cmdpb.RaftResponseHeader{},
+					AdminResponse: &raft_cmdpb.AdminResponse{CmdType: msg.AdminRequest.CmdType},
+				}
+				log.Infof("[S%d] RaftCmdResponse %+v %+v", d.PeerId(), resp, err)
+				cb.Done(resp)
+			}
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			{
+				context, _ := msg.AdminRequest.ChangePeer.Peer.Marshal()
+				cc := eraftpb.ConfChange{
+					ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
+					NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
+					Context:    context,
+				}
+				proposal := &proposal{d.nextProposalIndex(), d.Term(), cb}
+				if err := d.RaftGroup.ProposeConfChange(cc); err != nil {
+					cb.Done(ErrResp(err))
+					return
+				}
+				d.proposals = append(d.proposals, proposal)
+			}
+		}
+	} else {
+		// 将整个请求序列化为字节流
+		data, err := msg.Marshal()
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+
 		proposal := &proposal{d.nextProposalIndex(), d.Term(), cb}
 		if err := d.RaftGroup.Propose(data); err != nil {
 			cb.Done(ErrResp(err))

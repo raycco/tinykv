@@ -329,21 +329,32 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
 
-	// must clear meta first
+	var applyResult ApplySnapResult
+	applyResult.PrevRegion = ps.region
+	applyResult.Region = snapData.Region
+
+	log.Infof("%v raft state %+v, apply state %+v", ps.Tag, ps.raftState, ps.applyState)
+	// 先更新LastIndex，只清空LastIndex前的日志
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+
 	ps.clearMeta(kvWB, raftWB)
 	ps.clearExtraData(ps.region)
-
-	log.Infof("%v RaftSnapshotData %+v", ps.Tag, snapData)
-	log.Infof("%v raftState %+v, applyState %+v", ps.Tag, ps.raftState, ps.applyState)
 
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
 	ps.applyState.AppliedIndex = snapshot.Metadata.Index
 	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
 
-	ps.raftState.LastIndex = snapshot.Metadata.Index
-	ps.raftState.LastTerm = snapshot.Metadata.Term
-	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	ps.region = snapData.Region
+	regionState := &rspb.RegionLocalState{
+		Region: snapData.Region,
+		State:  rspb.PeerState_Normal,
+	}
+	kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), regionState)
+	log.Infof("%v raft state %+v, apply state %+v, region state %+v",
+		ps.Tag, ps.raftState, ps.applyState, regionState)
 
 	ch := make(chan bool, 1)
 	ps.snapState.StateType = snap.SnapState_Applying
@@ -355,14 +366,9 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		EndKey:   ps.region.GetEndKey(),
 	}
 
-	ps.region = snapData.Region
-	regionState := &rspb.RegionLocalState{
-		Region: snapData.Region,
-		State:  rspb.PeerState_Normal,
-	}
-	kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), regionState)
-
-	return nil, nil
+	// 等待apply snapshot完成
+	<-ch
+	return &applyResult, nil
 }
 
 // Save memory states to disk.
@@ -371,41 +377,45 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 
-	var err error
 	if !raft.IsEmptySnap(&ready.Snapshot) &&
 		ready.Snapshot.Metadata.Index > ps.applyState.TruncatedState.Index {
 		raftWB := new(engine_util.WriteBatch)
 		kvWB := new(engine_util.WriteBatch)
-		ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		applyResult, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
 		ps.Engines.WriteKV(kvWB)
 
-		if !raft.IsEmptyHardState(ready.HardState) {
-			ps.raftState.HardState = &ready.HardState
-		}
-		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+		ps.UpdateHardState(ready.HardState, raftWB)
 
 		if raftWB.Len() > 0 {
 			err = ps.Engines.WriteRaft(raftWB)
 		}
-		return nil, err
+		return applyResult, err
+	}
+
+	// SnapShot中index130，Entries中index 132，CommittedEntries中131，
+	// 此时先应用SnapShot，index 131与132都在内存中，若不把CommittedEntries
+	// 日志落盘会导致131，132丢失
+	raftWB := new(engine_util.WriteBatch)
+	for _, entry := range ready.CommittedEntries {
+		if entry.Index > ps.raftState.LastIndex {
+			raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+		}
 	}
 
 	if len(ready.Entries) > 0 && !reflect.DeepEqual(ready.Entries, []eraftpb.Entry{}) {
-		raftWB := new(engine_util.WriteBatch)
 		ps.Append(ready.Entries, raftWB)
 
 		lastIdx := len(ready.Entries) - 1
 		ps.raftState.LastIndex = ready.Entries[lastIdx].Index
 		ps.raftState.LastTerm = ready.Entries[lastIdx].Term
-		if !raft.IsEmptyHardState(ready.HardState) {
-			ps.raftState.HardState = &ready.HardState
-		}
 		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	}
 
-		if raftWB.Len() > 0 {
-			err = ps.Engines.WriteRaft(raftWB)
-		}
-		return nil, err
+	ps.UpdateHardState(ready.HardState, raftWB)
+
+	var err error
+	if raftWB.Len() > 0 {
+		err = ps.Engines.WriteRaft(raftWB)
 	}
 
 	return nil, err
@@ -451,4 +461,50 @@ func (ps *PeerStorage) UpdateTruncatedState(term, index uint64) {
 func (ps *PeerStorage) UpdateAppliedIndex(index uint64) {
 	ps.applyState.AppliedIndex = index
 	engine_util.PutMeta(ps.Engines.Kv, meta.ApplyStateKey(ps.region.Id), ps.applyState)
+}
+
+func (ps *PeerStorage) UpdateRegionState(cc eraftpb.ConfChange) bool {
+	var peer metapb.Peer
+	peer.Unmarshal(cc.Context)
+
+	idx := -1
+	for i, peer := range ps.region.Peers {
+		if peer.Id == cc.NodeId {
+			idx = i
+			break
+		}
+	}
+
+	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
+		if idx != -1 {
+			return false
+		} else {
+			ps.region.Peers = append(ps.region.Peers, &peer)
+		}
+	} else {
+		if idx != -1 {
+			ps.region.Peers = append(ps.region.Peers[:idx], ps.region.Peers[idx+1:]...)
+		} else {
+			return false
+		}
+	}
+	ps.region.RegionEpoch.ConfVer++
+
+	regionState := new(rspb.RegionLocalState)
+	regionState.Region = ps.region
+	regionState.State = rspb.PeerState_Normal
+	engine_util.PutMeta(ps.Engines.Kv, meta.RegionStateKey(ps.region.Id), regionState)
+	log.Infof("%v update region state: %+v", ps.Tag, regionState)
+	return true
+}
+
+func (ps *PeerStorage) UpdateHardState(hardState eraftpb.HardState, raftWB *engine_util.WriteBatch) {
+	log.Infof("%v ready raft state %+v, ps raft state %+v", ps.Tag, hardState, ps.raftState)
+	if !raft.IsEmptyHardState(hardState) &&
+		(hardState.Commit > ps.raftState.HardState.Commit ||
+			hardState.Term > ps.raftState.HardState.Term ||
+			hardState.Vote != ps.raftState.HardState.Vote) {
+		ps.raftState.HardState = &hardState
+		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	}
 }

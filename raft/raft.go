@@ -294,6 +294,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 	var msg pb.Message
 	prevLogIndex := r.Prs[to].Next - 1
 	firstIdx, _ := r.RaftLog.storage.FirstIndex()
+	log.Infof("%s send append to [S%d] next %+v first %+v applied %+v",
+		r.logPrefix, to, r.Prs[to].Next, firstIdx, r.RaftLog.applied)
 	if r.Prs[to].Next < firstIdx {
 		for {
 			snapshot, err := r.RaftLog.storage.Snapshot()
@@ -328,7 +330,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		//Commit:  r.RaftLog.committed,
 		//Index:   r.Prs[r.id].Match,
 		//LogTerm: term,
 	}
@@ -608,17 +610,25 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	r.becomeFollower(m.Term, m.From)
 
-	term, _ := r.RaftLog.Term(m.Index)
 	firstIdx, _ := r.RaftLog.storage.FirstIndex()
-	log.Infof("%s handle append entry m.Index: %+v m.LogTerm: %d, lastindex: %+v term %+v",
-		r.logPrefix, m.Index, m.LogTerm, r.RaftLog.LastIndex(), term)
-	if r.RaftLog.LastIndex() < m.Index || term != m.LogTerm {
+	lastIdx := r.RaftLog.LastIndex()
+	term, _ := r.RaftLog.Term(m.Index)
+	log.Infof("%s handle append entry m.Index: %+v m.LogTerm: %+v, firstIdx: %+v, lastIdx: %+v term %+v",
+		r.logPrefix, m.Index, m.LogTerm, firstIdx, lastIdx, term)
+
+	if firstIdx > 0 && m.Index < firstIdx-1 {
+		// m.Index: 291 m.LogTerm: 18, lastindex: 319 term 0
+		msg.Index = firstIdx
 		msg.Reject = true
-		if r.RaftLog.LastIndex() < m.Index || m.Index == 0 {
-			msg.Index = r.RaftLog.LastIndex() + 1
-		} else if m.Index < firstIdx {
-			// m.Index: 291 m.LogTerm: 18, lastindex: 319 term 0
-			msg.Index = r.RaftLog.committed
+		r.msgs = append(r.msgs, msg)
+		log.Infof("%s handle append entry conflict index %+v", r.logPrefix, msg.Index)
+		return
+	}
+
+	if lastIdx < m.Index || term != m.LogTerm {
+		msg.Reject = true
+		if lastIdx < m.Index || m.Index == 0 {
+			msg.Index = lastIdx + 1
 		} else {
 			msg.Index = r.searchConflictIndex(m.Index)
 		}
@@ -629,7 +639,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	index := m.Index + 1
 	conflict := false
-	for i := 0; i < len(m.Entries) && index <= r.RaftLog.LastIndex(); i++ {
+	for i := 0; i < len(m.Entries) && index <= lastIdx; i++ {
 		term, _ := r.RaftLog.Term(index)
 		log.Infof("%s handle append entry i %d, index: %+v term: %+v, entry term: %+v", r.logPrefix, i, index, term, m.Entries[i].Term)
 		if term != m.Entries[i].Term && i < len(m.Entries) {
@@ -650,25 +660,25 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	log.Infof("%s handle append entries stabled %+v index %+v mid: %+v", r.logPrefix, r.RaftLog.stabled, index, entries)
 
 	if len(entries) > 0 {
-		stableIdx := r.RaftLog.stabled
-		if index <= stableIdx {
-			firstIdx, lastIdx := entries[0].Index, entries[len(entries)-1].Index
-			if firstIdx <= stableIdx && stableIdx <= lastIdx {
+		stabled := r.RaftLog.stabled
+		if index <= stabled {
+			first, last := entries[0].Index, entries[len(entries)-1].Index
+			if first <= stabled && stabled <= last {
 				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
-					storage.Append(entries[:stableIdx-firstIdx+1])
-					//r.RaftLog.storage.(*MemoryStorage).Append(entries[:stableIdx-firstIdx+1])
+					storage.Append(entries[:stabled-first+1])
+					//r.RaftLog.storage.(*MemoryStorage).Append(entries[:stabled-first+1])
 				} else {
 					if len(r.RaftLog.entries) > 0 {
 						// truncate log after conflict index
-						if stableIdx > r.RaftLog.entries[0].Index {
-							r.RaftLog.entries = r.RaftLog.entries[:stableIdx-r.RaftLog.entries[0].Index]
+						if stabled > r.RaftLog.entries[0].Index {
+							r.RaftLog.entries = r.RaftLog.entries[:stabled-r.RaftLog.entries[0].Index]
 						} else if index > r.RaftLog.entries[0].Index {
 							r.RaftLog.entries = r.RaftLog.entries[:index-r.RaftLog.entries[0].Index]
 						}
 					}
-					r.RaftLog.entries = append(r.RaftLog.entries, entries[:stableIdx-firstIdx+1]...)
+					r.RaftLog.entries = append(r.RaftLog.entries, entries[:stabled-first+1]...)
 				}
-				r.RaftLog.entries = append(r.RaftLog.entries, entries[stableIdx-firstIdx:]...)
+				r.RaftLog.entries = append(r.RaftLog.entries, entries[stabled-first:]...)
 			} else {
 				if storage, ok := r.RaftLog.storage.(*MemoryStorage); ok {
 					storage.Append(entries)
@@ -724,6 +734,25 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.apply()
 }
 
+func (r *Raft) updateMatchCommit(from uint64) {
+	count := 1
+	index := r.Prs[from].Match
+	for peer, prs := range r.Prs {
+		if peer != r.id && prs.Match > r.RaftLog.committed {
+			count++
+			if prs.Match < index { // the min index for commit
+				index = prs.Match
+			}
+		}
+	}
+	term, _ := r.RaftLog.Term(index)
+	if count > len(r.Prs)/2 && term == r.Term {
+		r.RaftLog.committed = index
+		r.sendAppends()
+		r.apply()
+	}
+}
+
 func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 	// Your Code Here (2A).
 	if m.Term > r.Term {
@@ -745,25 +774,9 @@ func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 			log.Infof("%s handle append response progress from %+v: %+v commit: %d",
 				r.logPrefix, m.From, r.Prs[m.From], r.RaftLog.committed)
 
-			count := 1
-			index := r.Prs[m.From].Match
-			for peer, prs := range r.Prs {
-				if peer != r.id && prs.Match > r.RaftLog.committed {
-					count++
-					if prs.Match < index { // the min index for commit
-						index = prs.Match
-					}
-				}
-			}
-			term, _ := r.RaftLog.Term(index)
-			if count > len(r.Prs)/2 && term == r.Term {
-				r.RaftLog.committed = index
-				r.sendAppends()
-				r.apply()
-			}
-
-			if r.leadTransferee != 0 {
-				r.sendTimeoutNow(m.From)
+			r.updateMatchCommit(m.From)
+			if r.leadTransferee != 0 && r.Prs[r.leadTransferee].Next > r.RaftLog.LastIndex() {
+				r.sendTimeoutNow(r.leadTransferee)
 			}
 
 		}
@@ -801,6 +814,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		From:    r.id,
 		To:      m.From,
 		Term:    r.Term,
+		Index:   r.RaftLog.LastIndex(),
+		Commit:  r.RaftLog.committed,
 	}
 
 	/*term, _ := r.RaftLog.Term(m.Index)
@@ -818,8 +833,9 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}*/
 
 	r.resetElectionTimeout()
+	r.msgs = append(r.msgs, msg)
 
-	maxSameTermIdx := r.RaftLog.committed
+	/*maxSameTermIdx := r.RaftLog.committed
 	lastIdx := r.RaftLog.LastIndex()
 	for idx := r.RaftLog.committed + 1; idx <= lastIdx; idx++ {
 		term, _ := r.RaftLog.Term(idx)
@@ -840,7 +856,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 	if r.RaftLog.committed < m.Commit {
 		r.msgs = append(r.msgs, msg)
-	}
+	}*/
 }
 
 // handleRequestVote handle RequestVote RPC request
@@ -902,18 +918,35 @@ func (r *Raft) handleRequestVoteRsp(m pb.Message) {
 
 // handleHeartBeatRsp handle HeartBeat RPC response
 func (r *Raft) handleHeartbeatRsp(m pb.Message) {
-	r.sendAppend(m.From)
+	if m.Index < r.RaftLog.LastIndex() || m.Commit < r.RaftLog.committed {
+		if m.Commit < r.Prs[m.From].Match {
+			r.Prs[m.From] = &Progress{m.Commit, m.Commit + 1}
+		}
+		r.sendAppend(m.From)
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      m.From,
+		Term:    r.Term,
+	}
+
 	if r.Term > m.Term {
+		m.Reject = true
+		r.msgs = append(r.msgs, msg)
 		return
 	}
 
 	if !IsEmptySnap(r.RaftLog.pendingSnapshot) ||
 		m.Snapshot.Metadata.Index <= r.RaftLog.committed {
+		m.Index = r.RaftLog.committed
+		m.Reject = false
+		r.msgs = append(r.msgs, msg)
 		return
 	}
 
@@ -935,12 +968,18 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 			r.Prs[peer] = &Progress{r.RaftLog.committed, r.RaftLog.committed + 1}
 		}
 	}
+	m.Index = r.RaftLog.committed
+	m.Reject = false
+	r.msgs = append(r.msgs, msg)
 }
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	r.Prs[id] = &Progress{r.RaftLog.committed, r.RaftLog.committed + 1}
+	r.Prs[id] = &Progress{0, 1}
+	if r.State == StateLeader {
+		r.sendHeartbeat(id)
+	}
 }
 
 // removeNode remove a node from raft group
@@ -953,26 +992,15 @@ func (r *Raft) removeNode(id uint64) {
 	if len(r.Prs) <= 0 {
 		return
 	}
-	count := 1
-	index := r.Prs[r.id].Match
-	for peer, prs := range r.Prs {
-		if peer != r.id && prs.Match > r.RaftLog.committed {
-			count++
-			if prs.Match < index { // the min index for commit
-				index = prs.Match
-			}
-		}
-	}
-	term, _ := r.RaftLog.Term(index)
-	if count > len(r.Prs)/2 && term == r.Term {
-		r.RaftLog.committed = index
-		r.apply()
+
+	if r.State == StateLeader && id != r.id {
+		r.updateMatchCommit(r.id)
 	}
 }
 
 func (r *Raft) handleTransferLeader(m pb.Message) {
 	if r.State == StateLeader {
-		if m.From <= 0 {
+		if m.From <= 0 || r.id == m.From {
 			return
 		}
 
@@ -989,6 +1017,8 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 }
 
 func (r *Raft) sendTimeoutNow(to uint64) {
+	log.Infof("%s send timeout now: next %+v last %+v match %+v commit %+v",
+		r.logPrefix, r.Prs[to].Next, r.RaftLog.LastIndex(), r.Prs[to].Match, r.RaftLog.committed)
 	if r.Prs[to].Next < r.RaftLog.LastIndex() ||
 		r.Prs[to].Match < r.RaftLog.committed {
 		r.sendAppend(to)
