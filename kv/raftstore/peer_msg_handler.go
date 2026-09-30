@@ -340,6 +340,15 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			}
 		case raft_cmdpb.AdminCmdType_ChangePeer:
 			{
+				if msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+					transferee := d.RaftGroup.LeadTransferee()
+					d.RaftGroup.TransferLeader(transferee)
+					cb.Done(ErrResp(&util.ErrNotLeader{
+						RegionId: d.regionId,
+						Leader:   d.getPeerFromCache(transferee),
+					}))
+					return
+				}
 				context, _ := msg.AdminRequest.ChangePeer.Peer.Marshal()
 				cc := eraftpb.ConfChange{
 					ChangeType: msg.AdminRequest.ChangePeer.ChangeType,

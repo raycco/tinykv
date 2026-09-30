@@ -266,22 +266,37 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	return msg
 }
 
-func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64, snapshot *pb.Snapshot) pb.Message {
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
-	msg := pb.Message{
-		MsgType:  pb.MessageType_MsgSnapshot,
-		From:     r.id,
-		To:       to,
-		Term:     r.Term,
-		LogTerm:  prevLogTerm,
-		Index:    prevLogIndex,
-		Commit:   r.RaftLog.committed,
-		Snapshot: snapshot,
+func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
+	var msg pb.Message
+	for {
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		log.Infof("%s request snapshot to [S%d] snapshot %+v err: %+v", r.logPrefix, to, snapshot, err)
+		if err == ErrSnapshotTemporarilyUnavailable {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		} else {
+			if err == nil {
+				prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+				msg = pb.Message{
+					MsgType:  pb.MessageType_MsgSnapshot,
+					From:     r.id,
+					To:       to,
+					Term:     r.Term,
+					LogTerm:  prevLogTerm,
+					Index:    prevLogIndex,
+					Commit:   r.RaftLog.committed,
+					Snapshot: &snapshot,
+				}
+
+				r.Prs[to] = &Progress{snapshot.Metadata.Index, snapshot.Metadata.Index + 1}
+
+				log.Infof("%s send snapshot to [S%d] LII: %+v, push msg: %+v", r.logPrefix, to, r.RaftLog.LastIndex(), msg)
+			} else {
+				msg = r.buildAppend(prevLogIndex, to)
+			}
+			break
+		}
 	}
-
-	r.Prs[to] = &Progress{snapshot.Metadata.Index, snapshot.Metadata.Index + 1}
-
-	log.Infof("%s send snapshot to [S%d] LII: %+v, push msg: %+v", r.logPrefix, to, r.RaftLog.LastIndex(), msg)
 
 	return msg
 }
@@ -297,21 +312,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	log.Infof("%s send append to [S%d] next %+v first %+v applied %+v",
 		r.logPrefix, to, r.Prs[to].Next, firstIdx, r.RaftLog.applied)
 	if r.Prs[to].Next < firstIdx {
-		for {
-			snapshot, err := r.RaftLog.storage.Snapshot()
-			log.Infof("%s request snapshot to [S%d] snapshot %+v err: %+v", r.logPrefix, to, snapshot, err)
-			if err == ErrSnapshotTemporarilyUnavailable {
-				time.Sleep(20 * time.Millisecond)
-				continue
-			} else {
-				if err == nil {
-					msg = r.buildSnapshot(prevLogIndex, to, &snapshot)
-				} else {
-					msg = r.buildAppend(prevLogIndex, to)
-				}
-				break
-			}
-		}
+		msg = r.buildSnapshot(prevLogIndex, to)
 	} else {
 		msg = r.buildAppend(prevLogIndex, to)
 	}
@@ -719,6 +720,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	if len(entries) > 0 {
 		msg.Index = entries[len(entries)-1].Index
+	} else {
+		// follower的日志已经和leader同步，由于回复丢失，导致一直transferleader
+		msg.Index = r.RaftLog.LastIndex()
 	}
 	msg.Reject = false
 	r.msgs = append(r.msgs, msg)
@@ -818,45 +822,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		Commit:  r.RaftLog.committed,
 	}
 
-	/*term, _ := r.RaftLog.Term(m.Index)
-	if r.RaftLog.LastIndex() < m.Index || term != m.LogTerm {
-		r.msgs = append(r.msgs, msg)
-		return
-	}
-
-	if m.Commit > r.RaftLog.committed {
-		if m.Commit <= r.Prs[r.id].Match {
-			r.RaftLog.committed = m.Commit
-		} else {
-			r.RaftLog.committed = r.Prs[r.id].Match
-		}
-	}*/
-
 	r.resetElectionTimeout()
 	r.msgs = append(r.msgs, msg)
-
-	/*maxSameTermIdx := r.RaftLog.committed
-	lastIdx := r.RaftLog.LastIndex()
-	for idx := r.RaftLog.committed + 1; idx <= lastIdx; idx++ {
-		term, _ := r.RaftLog.Term(idx)
-		if term == r.Term {
-			maxSameTermIdx = idx
-		} else {
-			continue
-		}
-	}
-
-	if m.Commit > maxSameTermIdx {
-		r.RaftLog.committed = maxSameTermIdx
-	} else {
-		r.RaftLog.committed = m.Commit
-	}
-
-	r.apply()
-
-	if r.RaftLog.committed < m.Commit {
-		r.msgs = append(r.msgs, msg)
-	}*/
 }
 
 // handleRequestVote handle RequestVote RPC request
@@ -977,9 +944,6 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
 	r.Prs[id] = &Progress{0, 1}
-	if r.State == StateLeader {
-		r.sendHeartbeat(id)
-	}
 }
 
 // removeNode remove a node from raft group
@@ -1033,4 +997,16 @@ func (r *Raft) sendTimeoutNow(to uint64) {
 	}
 
 	r.msgs = append(r.msgs, msg)
+}
+
+func (r *Raft) LeadTransferee() uint64 {
+	id := r.id
+	var match uint64
+	for peer, prs := range r.Prs {
+		if peer != r.id && prs.Match > match {
+			id = peer
+			match = prs.Match
+		}
+	}
+	return id
 }

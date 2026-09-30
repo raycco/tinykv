@@ -312,7 +312,10 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	for _, entry := range entries {
 		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
 	}
-	//err := ps.Engines.WriteRaft(raftWB)
+	lastIdx := len(entries) - 1
+	ps.raftState.LastIndex = entries[lastIdx].Index
+	ps.raftState.LastTerm = entries[lastIdx].Term
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	return nil
 }
 
@@ -386,29 +389,31 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 
 		ps.UpdateHardState(ready.HardState, raftWB)
 
+		// SnapShot中index 486，CommittedEntries中487，此时先应用SnapShot，
+		// raftState.LastIndex不更新，而在后续process时更新AppliedIndex，
+		// 重启unexpected raft log index: lastIndex 486 < appliedIndex 487
+		commitEnts := ps.unstableCommitEnts(ready.CommittedEntries)
+		if len(commitEnts) > 0 {
+			ps.Append(commitEnts, raftWB)
+		}
+
 		if raftWB.Len() > 0 {
 			err = ps.Engines.WriteRaft(raftWB)
 		}
 		return applyResult, err
 	}
 
-	// SnapShot中index130，Entries中index 132，CommittedEntries中131，
+	// SnapShot中index 130，Entries中index 132，CommittedEntries中131，
 	// 此时先应用SnapShot，index 131与132都在内存中，若不把CommittedEntries
 	// 日志落盘会导致131，132丢失
 	raftWB := new(engine_util.WriteBatch)
-	for _, entry := range ready.CommittedEntries {
-		if entry.Index > ps.raftState.LastIndex {
-			raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
-		}
+	commitEnts := ps.unstableCommitEnts(ready.CommittedEntries)
+	if len(commitEnts) > 0 {
+		ps.Append(commitEnts, raftWB)
 	}
 
 	if len(ready.Entries) > 0 && !reflect.DeepEqual(ready.Entries, []eraftpb.Entry{}) {
 		ps.Append(ready.Entries, raftWB)
-
-		lastIdx := len(ready.Entries) - 1
-		ps.raftState.LastIndex = ready.Entries[lastIdx].Index
-		ps.raftState.LastTerm = ready.Entries[lastIdx].Term
-		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	}
 
 	ps.UpdateHardState(ready.HardState, raftWB)
@@ -507,4 +512,14 @@ func (ps *PeerStorage) UpdateHardState(hardState eraftpb.HardState, raftWB *engi
 		ps.raftState.HardState = &hardState
 		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	}
+}
+
+func (ps *PeerStorage) unstableCommitEnts(entries []eraftpb.Entry) []eraftpb.Entry {
+	var commitEnts []eraftpb.Entry
+	for _, entry := range entries {
+		if entry.Index > ps.raftState.LastIndex {
+			commitEnts = append(commitEnts, entry)
+		}
+	}
+	return commitEnts
 }
