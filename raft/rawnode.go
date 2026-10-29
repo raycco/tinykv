@@ -200,7 +200,10 @@ func (rn *RawNode) Advance(rd Ready) {
 	// 注：此时应用snap只应该删除225之前的日志，而非删除当前storage中所有日志
 	var applied, stabled uint64
 	firstIdx, _ := rn.Raft.RaftLog.storage.FirstIndex()
-	if !IsEmptySnap(&rd.Snapshot) && firstIdx > 0 && rd.Snapshot.Metadata.Index > firstIdx-1 {
+	hasSnapshot := !IsEmptySnap(&rd.Snapshot)
+	if hasSnapshot && firstIdx > 0 && rd.Snapshot.Metadata.Index >= firstIdx-1 {
+		// 处理snapshot meta index:243，apply snapshot时truncated_state从index:216变为243，
+		// 此时first index = truncated index + 1，因此需要加上等号才能重置pendingSnapshot
 		applied = rd.Snapshot.Metadata.Index
 		stabled = rd.Snapshot.Metadata.Index
 		rn.Raft.RaftLog.pendingSnapshot = nil
@@ -220,7 +223,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	rn.Raft.RaftLog.AdvanceStabled(stabled)
 
 	rn.Raft.msgs = make([]pb.Message, 0)
-	log.Infof("%s advance: all entries %+v", rn.logPrefix, rn.Raft.RaftLog.allEntries())
+	//log.Debugf("%s advance: all entries %+v", rn.logPrefix, rn.Raft.RaftLog.allEntries())
+	log.Infof("%s advance: snapshot = %+v, firstIdx = %+v, applied = %+v, stabled = %+v",
+		rn.logPrefix, hasSnapshot, firstIdx, rn.Raft.RaftLog.applied, rn.Raft.RaftLog.stabled)
 }
 
 // GetProgress return the Progress of this node and its peers, if this

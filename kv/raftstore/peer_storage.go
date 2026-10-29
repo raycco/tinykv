@@ -468,39 +468,12 @@ func (ps *PeerStorage) UpdateAppliedIndex(index uint64) {
 	engine_util.PutMeta(ps.Engines.Kv, meta.ApplyStateKey(ps.region.Id), ps.applyState)
 }
 
-func (ps *PeerStorage) UpdateRegionState(cc eraftpb.ConfChange) bool {
-	var peer metapb.Peer
-	peer.Unmarshal(cc.Context)
-
-	idx := -1
-	for i, peer := range ps.region.Peers {
-		if peer.Id == cc.NodeId {
-			idx = i
-			break
-		}
-	}
-
-	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
-		if idx != -1 {
-			return false
-		} else {
-			ps.region.Peers = append(ps.region.Peers, &peer)
-		}
-	} else {
-		if idx != -1 {
-			ps.region.Peers = append(ps.region.Peers[:idx], ps.region.Peers[idx+1:]...)
-		} else {
-			return false
-		}
-	}
-	ps.region.RegionEpoch.ConfVer++
-
+func (ps *PeerStorage) UpdateRegionState(region *metapb.Region) {
 	regionState := new(rspb.RegionLocalState)
-	regionState.Region = ps.region
+	regionState.Region = region
 	regionState.State = rspb.PeerState_Normal
-	engine_util.PutMeta(ps.Engines.Kv, meta.RegionStateKey(ps.region.Id), regionState)
+	engine_util.PutMeta(ps.Engines.Kv, meta.RegionStateKey(region.Id), regionState)
 	log.Infof("%v update region state: %+v", ps.Tag, regionState)
-	return true
 }
 
 func (ps *PeerStorage) UpdateHardState(hardState eraftpb.HardState, raftWB *engine_util.WriteBatch) {

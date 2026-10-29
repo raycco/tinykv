@@ -87,7 +87,7 @@ func (l *RaftLog) allEntries() []pb.Entry {
 	firstIndex, _ := l.storage.FirstIndex()
 	lastIndex, _ := l.storage.LastIndex()
 	entries, _ := l.storage.Entries(firstIndex, lastIndex+1)
-	log.Debugf("all entries storage %+v memory %+v", entries, l.entries)
+	//log.Debugf("all entries storage %+v memory %+v", entries, l.entries)
 	entries = append(entries, l.entries...)
 
 	ents := l.trimEnts(entries)
