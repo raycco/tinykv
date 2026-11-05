@@ -335,7 +335,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
-		hasSnapshot := ready.Snapshot.Metadata == nil || ready.Snapshot.Metadata.Index == 0
+		hasSnapshot := !(ready.Snapshot.Metadata == nil || ready.Snapshot.Metadata.Index == 0)
 		log.Infof("[S%d] has snapshot: %+v, msgs: %+v, entries: %+v, commit entries: %+v",
 			d.PeerId(), hasSnapshot, len(ready.Messages), len(ready.Entries), len(ready.CommittedEntries))
 		applyResult, err := d.peerStorage.SaveReadyState(&ready)

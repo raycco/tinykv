@@ -61,13 +61,32 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	stabled, _ := storage.LastIndex()
-	hardState, _, _ := storage.InitialState()
+	firstIdx, err := storage.FirstIndex()
+	if err != nil {
+		log.Panicf("init log first index err: %+v", err)
+	}
+
+	lastIdx, err := storage.LastIndex()
+	if err != nil {
+		log.Panicf("init log last index err: %+v", err)
+	}
+
+	entries, err := storage.Entries(firstIdx, lastIdx+1)
+	if err != nil {
+		log.Panicf("init log entries firstIdx=%+v lastIdx=%+v err: %+v", firstIdx, lastIdx, err)
+	}
+
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		log.Panicf("init log initial state err: %+v", err)
+	}
+
 	return &RaftLog{
 		storage:         storage,
-		applied:         0,
+		applied:         firstIdx - 1,
 		committed:       hardState.Commit,
-		stabled:         stabled,
+		stabled:         lastIdx,
+		entries:         entries,
 		pendingSnapshot: nil,
 	}
 }
@@ -84,13 +103,31 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	firstIndex, _ := l.storage.FirstIndex()
-	lastIndex, _ := l.storage.LastIndex()
-	entries, _ := l.storage.Entries(firstIndex, lastIndex+1)
-	//log.Debugf("all entries storage %+v memory %+v", entries, l.entries)
+	firstIdx, err := l.storage.FirstIndex()
+	if err != nil {
+		log.Panicf("all entries first index err: %+v", err)
+	}
+
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		log.Panicf("all entries last index err: %+v", err)
+	}
+
+	log.Infof("all entries: storage fisrtIdx=%+v and lastIdx=%+v, stabled=%+v", firstIdx, lastIdx, l.stabled)
+
+	var stabledEnts []pb.Entry
+	if firstIdx <= l.stabled && l.stabled <= lastIdx {
+		stabledEnts, err = l.storage.Entries(firstIdx, l.stabled+1)
+		if err != nil {
+			log.Panicf("all entries storage entries err: %+v", err)
+		}
+	}
+
+	entries := make([]pb.Entry, len(stabledEnts))
+	copy(entries, stabledEnts)
 	entries = append(entries, l.entries...)
 
-	ents := l.trimEnts(entries)
+	ents := l.trimDummyEnts(entries)
 
 	return ents
 }
@@ -102,10 +139,17 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		return []pb.Entry{}
 	}
 
-	lastIndex, _ := l.storage.LastIndex()
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		log.Panicf("unstable entries last index err: %+v", err)
+	}
+
 	var entries []pb.Entry
-	if l.stabled < lastIndex && len(l.entries) <= 0 {
-		entries, _ = l.storage.Entries(l.stabled+1, lastIndex+1)
+	if l.stabled < lastIdx && len(l.entries) == 0 {
+		entries, err = l.storage.Entries(l.stabled+1, lastIdx+1)
+		if err != nil {
+			log.Panicf("unstable entries storage entries err: %+v", err)
+		}
 	} else {
 		for _, entry := range l.entries {
 			if entry.Index > l.stabled {
@@ -114,8 +158,8 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		}
 	}
 
-	log.Debugf("get unstable entries: stabled = %+v, committed = %+v, storage lastIndex = %+v lastIndex = %+v entries %+v",
-		l.stabled, l.committed, lastIndex, l.LastIndex(), entries)
+	log.Infof("unstable entries: stabled=%+v, committed=%+v, storage lastIdx=%+v, lastIdx=%+v, entries = %+v",
+		l.stabled, l.committed, lastIdx, l.LastIndex(), entries)
 
 	if len(entries) == 0 {
 		return []pb.Entry{}
@@ -127,74 +171,88 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	lastIndex, _ := l.storage.LastIndex()
-	var entries []pb.Entry
-	if l.applied < lastIndex {
-		if lastIndex > l.committed {
-			entries, _ = l.storage.Entries(l.applied+1, l.committed+1)
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		log.Panicf("next entries last index err: %+v", err)
+	}
+
+	var stabledEnts []pb.Entry
+	if l.applied < lastIdx {
+		if lastIdx > l.committed {
+			stabledEnts, err = l.storage.Entries(l.applied+1, l.committed+1)
 		} else {
-			entries, _ = l.storage.Entries(l.applied+1, lastIndex+1)
+			stabledEnts, err = l.storage.Entries(l.applied+1, lastIdx+1)
+		}
+
+		if err != nil {
+			log.Panicf("next entries storage entries err: %+v", err)
 		}
 	}
+
+	// 直接append到stabledEnts会修改MemoryStorage中的内容
+	entries := make([]pb.Entry, len(stabledEnts))
+	copy(entries, stabledEnts)
 	for _, entry := range l.entries {
 		if entry.Index <= l.committed && entry.Index > l.applied {
 			entries = append(entries, entry)
 		}
 	}
 
-	ents = l.trimEnts(entries)
+	ents = l.trimDummyEnts(entries)
 
-	log.Debugf("next ents applied = %+v, committed = %+v, storage lastIndex = %+v memory lastIndex = %+v ents = %+v",
-		l.applied, l.committed, lastIndex, l.LastIndex(), ents)
+	log.Infof("next entries: applied=%+v, committed=%+v, storage lastIdx=%+v, lastIdx=%+v",
+		l.applied, l.committed, lastIdx, l.LastIndex())
 
 	return ents
+}
+
+func (l *RaftLog) FirstIndex() (uint64, error) {
+	return l.storage.FirstIndex()
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	var lastIndex uint64
-	if len(l.entries) >= 1 {
-		lastIndex = l.entries[len(l.entries)-1].Index
+	var lastIdx uint64
+	if len(l.entries) > 0 {
+		lastIdx = l.entries[len(l.entries)-1].Index
 	} else {
-		lastIndex, _ = l.storage.LastIndex()
-		if lastIndex == 0 && l.pendingSnapshot != nil {
-			lastIndex = l.pendingSnapshot.Metadata.Index
-		}
+		lastIdx, _ = l.storage.LastIndex()
 	}
-	return lastIndex
+
+	if l.pendingSnapshot != nil &&
+		l.pendingSnapshot.Metadata != nil &&
+		l.pendingSnapshot.Metadata.Index > lastIdx {
+		lastIdx = l.pendingSnapshot.Metadata.Index
+	}
+	return lastIdx
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if l.pendingSnapshot != nil && i <= l.pendingSnapshot.Metadata.Index {
+	if l.pendingSnapshot != nil &&
+		l.pendingSnapshot.Metadata != nil &&
+		i <= l.pendingSnapshot.Metadata.Index {
 		return l.pendingSnapshot.Metadata.Term, nil
 	}
 
-	lastIndex, _ := l.storage.LastIndex()
-	if i <= lastIndex {
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		log.Panicf("term last index err: %+v", err)
+	}
+	if (i <= l.stabled && l.stabled <= lastIdx) || len(l.entries) == 0 {
 		return l.storage.Term(i)
-	}
-
-	for _, entry := range l.entries {
-		if entry.Index == i {
-			return entry.Term, nil
+	} else {
+		offset := l.entries[0].Index
+		if i < offset {
+			return 0, ErrCompacted
 		}
-	}
-
-	return 0, nil
-}
-
-func (l *RaftLog) ArrIndex(i uint64) int {
-	// Your Code Here (2A).
-	for arrIndex, entry := range l.entries {
-		if entry.Index == i {
-			return arrIndex
+		if int(i-offset) >= len(l.entries) {
+			return 0, ErrUnavailable
 		}
+		return l.entries[i-offset].Term, nil
 	}
-
-	return 0
 }
 
 func (l *RaftLog) AdvanceApplied(applied uint64) {
@@ -214,7 +272,10 @@ func (l *RaftLog) AdvanceStabled(stabled uint64) {
 	}
 
 	// snap与append乱序可能导致stabled > storage.LastIndex()
-	lastIdx, _ := l.storage.LastIndex()
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		log.Panicf("advance stabled last index err: %+v", err)
+	}
 	if l.stabled > lastIdx {
 		l.stabled = lastIdx
 	}
@@ -233,7 +294,7 @@ func (l *RaftLog) AdvanceStabled(stabled uint64) {
 	}
 }
 
-func (l *RaftLog) trimEnts(entries []pb.Entry) (ents []pb.Entry) {
+func (l *RaftLog) trimDummyEnts(entries []pb.Entry) (ents []pb.Entry) {
 	mapIdxEntry := make(map[uint64]pb.Entry)
 	for _, entry := range entries {
 		mapIdxEntry[entry.Index] = entry
@@ -251,4 +312,24 @@ func (l *RaftLog) trimEnts(entries []pb.Entry) (ents []pb.Entry) {
 		ents = append(ents, mapIdxEntry[idx])
 	}
 	return ents
+}
+
+func (l *RaftLog) appendEnts(entries []pb.Entry, index uint64, conflict bool) {
+	firstIdx, err := l.FirstIndex()
+	if err != nil {
+		log.Panicf("append entries first index err: %+v", err)
+	}
+	if conflict && len(l.entries) > 0 && index >= firstIdx {
+		// truncate log after conflict index
+		if index-firstIdx > uint64(len(l.entries)) {
+			l.entries = l.entries[:0]
+		} else {
+			l.entries = l.entries[:index-firstIdx]
+		}
+	}
+	l.entries = append(l.entries, entries...)
+
+	if conflict {
+		l.stabled = index - 1
+	}
 }
