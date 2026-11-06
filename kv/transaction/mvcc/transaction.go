@@ -190,10 +190,11 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 		}
 	}
 
-	if maxStartTs > 0 {
+	return txn.getWriteAndCommitTs(key, maxStartTs, false)
+	/*if maxStartTs > 0 {
 		return txn.getWriteAndCommitTs(key, maxStartTs, false)
 	}
-	return nil, 0, nil
+	return nil, 0, nil*/
 }
 
 func (txn *MvccTxn) getWriteAndCommitTs(key []byte, ts uint64, current bool) (*Write, uint64, error) {
