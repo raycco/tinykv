@@ -92,6 +92,8 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	defer iter.Close()
 
 	var maxCommitTs uint64
+	var value []byte
+	iter.Seek(key)
 	for ; iter.Valid(); iter.Next() {
 		item := iter.Item()
 		userKey := DecodeUserKey(item.Key())
@@ -102,15 +104,15 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 		commitTs := decodeTimestamp(item.Key())
 		if txn.StartTS >= commitTs && commitTs > maxCommitTs {
 			maxCommitTs = commitTs
+			var err error
+			value, err = item.Value()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	if maxCommitTs > 0 {
-		value, err := txn.Reader.GetCF(engine_util.CfWrite, EncodeKey(key, maxCommitTs))
-		if err != nil {
-			return nil, err
-		}
-
 		write, err := ParseWrite(value)
 		if err != nil {
 			return nil, err
@@ -144,67 +146,12 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 // write's commit timestamp, or an error.
 func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
-	iterDefault := txn.Reader.IterCF(engine_util.CfDefault)
-	defer iterDefault.Close()
+	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
 
-	var find bool
-	for ; iterDefault.Valid(); iterDefault.Next() {
-		item := iterDefault.Item()
-		userKey := DecodeUserKey(item.Key())
-		if !bytes.Equal(userKey, key) {
-			continue
-		}
-
-		startTs := decodeTimestamp(item.Key())
-		if txn.StartTS == startTs {
-			find = true
-			break
-		}
-	}
-
-	if find {
-		return txn.getWriteAndCommitTs(key, txn.StartTS, true)
-	}
-
-	return nil, 0, nil
-}
-
-// MostRecentWrite finds the most recent write with the given key. It returns a Write from the DB and that
-// write's commit timestamp, or an error.
-func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
-	// Your Code Here (4A).
-	iterDefault := txn.Reader.IterCF(engine_util.CfDefault)
-	defer iterDefault.Close()
-
-	var maxStartTs uint64
-	for ; iterDefault.Valid(); iterDefault.Next() {
-		item := iterDefault.Item()
-		userKey := DecodeUserKey(item.Key())
-		if !bytes.Equal(userKey, key) {
-			continue
-		}
-
-		startTs := decodeTimestamp(item.Key())
-		if startTs > maxStartTs {
-			maxStartTs = startTs
-		}
-	}
-
-	return txn.getWriteAndCommitTs(key, maxStartTs, false)
-	/*if maxStartTs > 0 {
-		return txn.getWriteAndCommitTs(key, maxStartTs, false)
-	}
-	return nil, 0, nil*/
-}
-
-func (txn *MvccTxn) getWriteAndCommitTs(key []byte, ts uint64, current bool) (*Write, uint64, error) {
-	iterWrite := txn.Reader.IterCF(engine_util.CfWrite)
-	defer iterWrite.Close()
-
-	var resWrite *Write
-	var resCommitTs uint64
-	for ; iterWrite.Valid(); iterWrite.Next() {
-		item := iterWrite.Item()
+	iter.Seek(key)
+	for ; iter.Valid(); iter.Next() {
+		item := iter.Item()
 		userKey := DecodeUserKey(item.Key())
 		if !bytes.Equal(userKey, key) {
 			continue
@@ -220,24 +167,51 @@ func (txn *MvccTxn) getWriteAndCommitTs(key []byte, ts uint64, current bool) (*W
 			return nil, 0, err
 		}
 
-		commitTs := decodeTimestamp(item.Key())
-		if current {
-			if write.StartTS == ts {
-				resWrite = write
-				resCommitTs = decodeTimestamp(item.Key())
-			}
-		} else {
-			if write.StartTS >= ts && commitTs > resCommitTs {
-				resWrite = write
-				resCommitTs = decodeTimestamp(item.Key())
-			}
+		if write.StartTS == txn.StartTS {
+			commitTs := decodeTimestamp(item.Key())
+			return write, commitTs, nil
 		}
 	}
 
-	if resCommitTs > 0 {
-		return resWrite, resCommitTs, nil
-	}
 	return nil, 0, nil
+}
+
+// MostRecentWrite finds the most recent write with the given key. It returns a Write from the DB and that
+// write's commit timestamp, or an error.
+func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
+	// Your Code Here (4A).
+	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
+
+	var maxStartTs uint64
+	var commitTs uint64
+	var maxWrite *Write
+	iter.Seek(key)
+	for ; iter.Valid(); iter.Next() {
+		item := iter.Item()
+		userKey := DecodeUserKey(item.Key())
+		if !bytes.Equal(userKey, key) {
+			continue
+		}
+
+		value, err := item.Value()
+		if err != nil {
+			return nil, 0, err
+		}
+
+		write, err := ParseWrite(value)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if write.StartTS > maxStartTs {
+			maxStartTs = write.StartTS
+			commitTs = decodeTimestamp(item.Key())
+			maxWrite = write
+		}
+	}
+
+	return maxWrite, commitTs, nil
 }
 
 // EncodeKey encodes a user key and appends an encoded timestamp to a key. Keys and timestamps are encoded so that

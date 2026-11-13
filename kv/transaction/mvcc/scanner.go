@@ -70,6 +70,7 @@ func (scan *Scanner) Next() ([]byte, []byte, error) {
 			break
 		}
 	}
+
 	for ; scan.iterWrite.Valid(); scan.iterWrite.Next() {
 		writeItem := scan.iterWrite.Item()
 
