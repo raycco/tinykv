@@ -240,12 +240,13 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 
 	//entries := make([]pb.Entry, r.RaftLog.LastIndex()-prevLogIndex)
 	lastIdx := r.RaftLog.LastIndex()
-	var entries []pb.Entry
+	entries := r.RaftLog.buildAppendEnts(r.Prs[to].Next)
+	/*var entries []pb.Entry
 	for _, entry := range r.RaftLog.allEntries() {
 		if entry.Index >= r.Prs[to].Next {
 			entries = append(entries, entry)
 		}
-	}
+	}*/
 	//copy(entries, r.RaftLog.allEntries()[lastIdx-prevLogIndex:])
 
 	log.Debugf("%s send append entries to [S%d]: lastIdx=%+v, push entries = %+v", r.logPrefix, to, lastIdx, entries)

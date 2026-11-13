@@ -223,7 +223,6 @@ func (rn *RawNode) Advance(rd Ready) {
 	rn.Raft.RaftLog.AdvanceStabled(stabled)
 
 	rn.Raft.msgs = make([]pb.Message, 0)
-	//log.Debugf("%s advance: all entries %+v", rn.logPrefix, rn.Raft.RaftLog.allEntries())
 	log.Infof("%s advance: snapshot = %+v, firstIdx = %+v, applied = %+v, stabled = %+v",
 		rn.logPrefix, hasSnapshot, firstIdx, rn.Raft.RaftLog.applied, rn.Raft.RaftLog.stabled)
 }

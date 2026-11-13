@@ -217,7 +217,11 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) > 0 {
 		lastIdx = l.entries[len(l.entries)-1].Index
 	} else {
-		lastIdx, _ = l.storage.LastIndex()
+		var err error
+		lastIdx, err = l.storage.LastIndex()
+		if err != nil {
+			log.Panicf("last index err: %+v", err)
+		}
 	}
 
 	if l.pendingSnapshot != nil &&
@@ -332,4 +336,36 @@ func (l *RaftLog) appendEnts(entries []pb.Entry, index uint64, conflict bool) {
 	if conflict {
 		l.stabled = index - 1
 	}
+}
+
+func (l *RaftLog) buildAppendEnts(index uint64) []pb.Entry {
+
+	var entries []pb.Entry
+	if index > l.LastIndex() {
+		return entries
+	}
+
+	lastIdx, err := l.storage.LastIndex()
+	if err != nil {
+		log.Panicf("build entries last index err: %+v", err)
+	}
+
+	var stabledEnts []pb.Entry
+	if index <= lastIdx {
+		stabledEnts, err = l.storage.Entries(index, lastIdx+1)
+		if err != nil {
+			log.Panicf("build entries storage entries err: %+v", err)
+		}
+	}
+
+	entries = make([]pb.Entry, len(stabledEnts))
+	copy(entries, stabledEnts)
+	for _, entry := range l.entries {
+		if entry.Index >= index {
+			entries = append(entries, entry)
+		}
+	}
+
+	ents := l.trimDummyEnts(entries)
+	return ents
 }

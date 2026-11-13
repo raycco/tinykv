@@ -490,6 +490,16 @@ func (d *peerMsgHandler) proposeConf(msg *raft_cmdpb.RaftCmdRequest, cb *message
 	d.proposals = append(d.proposals, proposal)
 }
 
+func (d *peerMsgHandler) proposeTransferLeader(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header:        &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{CmdType: msg.AdminRequest.CmdType},
+	}
+	log.Infof("[S%d] RaftCmdResponse %+v", d.PeerId(), resp)
+	cb.Done(resp)
+}
+
 func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	switch msg.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
@@ -499,15 +509,7 @@ func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb 
 	case raft_cmdpb.AdminCmdType_Split:
 		d.proposeInternal(msg)
 	case raft_cmdpb.AdminCmdType_TransferLeader:
-		{
-			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
-			resp := &raft_cmdpb.RaftCmdResponse{
-				Header:        &raft_cmdpb.RaftResponseHeader{},
-				AdminResponse: &raft_cmdpb.AdminResponse{CmdType: msg.AdminRequest.CmdType},
-			}
-			log.Infof("[S%d] RaftCmdResponse %+v", d.PeerId(), resp)
-			cb.Done(resp)
-		}
+		d.proposeTransferLeader(msg, cb)
 	}
 }
 
