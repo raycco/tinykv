@@ -232,7 +232,7 @@ func (r *Raft) sendAppends() {
 func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err != nil {
-		log.Panicf("send append entries prev log term err: %+v", err)
+		log.Panicf("%s send append entries prev log term err: %+v", r.logPrefix, err)
 	}
 
 	log.Infof("%s send append entries to [S%d]: prevLogIndex=%+v, prevLogTerm=%+v, stabled=%+v",
@@ -299,11 +299,13 @@ func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
 	if r.RaftLog.pendingSnapshot != nil {
 		return r.buildSnapshotMsg(prevLogIndex, to, r.RaftLog.pendingSnapshot)
 	}
+	retryCount := 0
 	for {
 		snapshot, err := r.RaftLog.storage.Snapshot()
 		log.Infof("%s request snapshot for [S%d]: snapshot = %+v err: %+v", r.logPrefix, to, snapshot, err)
-		if err == ErrSnapshotTemporarilyUnavailable {
+		if err == ErrSnapshotTemporarilyUnavailable && retryCount < 5 {
 			time.Sleep(20 * time.Millisecond)
+			retryCount++
 			continue
 		} else {
 			if err == nil {
@@ -326,7 +328,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := r.Prs[to].Next - 1
 	firstIdx, err := r.RaftLog.FirstIndex()
 	if err != nil {
-		log.Panicf("send append entries to %v err: %v", to, err)
+		log.Panicf("%s send append entries to %v err: %v", r.logPrefix, to, err)
 	}
 	log.Infof("%s send append entries to [S%d]: nextIdx=%+v, firstIdx=%+v, applied=%+v",
 		r.logPrefix, to, r.Prs[to].Next, firstIdx, r.RaftLog.applied)
@@ -630,12 +632,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	firstIdx, err := r.RaftLog.FirstIndex()
 	if err != nil {
-		log.Panicf("handle append entries first index err: %+v", err)
+		log.Panicf("%s handle append entries first index err: %+v", r.logPrefix, err)
 	}
 
 	term, err := r.RaftLog.Term(m.Index)
 	if err != nil {
-		log.Debugf("handle append entries prev term %+v err: %+v", term, err.Error())
+		log.Debugf("%s handle append entries prev term %+v err: %+v", r.logPrefix, term, err.Error())
 	}
 
 	lastIdx := r.RaftLog.LastIndex()
@@ -756,7 +758,12 @@ func (r *Raft) handleAppendEntriesRsp(m pb.Message) {
 
 	if m.Reject {
 		if m.Term == r.Term && m.Index < r.Prs[m.From].Next {
-			r.Prs[m.From].Next = m.Index
+			// Follower的收到AppendEntries时Term为15，而Leader的Term为13，由于网络延迟，Leader收到
+			// AppendEntriesResponse时Term刚好为15，但m.Index = 0，此时如果直接修改nextIndex，会报错
+			// panic: send append entries prev log term err: low 18446744073709551615 is greater than high 0
+			if m.Index > 0 {
+				r.Prs[m.From].Next = m.Index
+			}
 			r.sendAppend(m.From)
 		}
 	} else {

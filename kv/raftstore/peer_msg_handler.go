@@ -9,7 +9,6 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
-	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
@@ -115,7 +114,12 @@ func (d *peerMsgHandler) processCompactLog(compact *raft_cmdpb.CompactLogRequest
 	}
 }
 
-func (d *peerMsgHandler) processSpilt(split *raft_cmdpb.SplitRequest) {
+func (d *peerMsgHandler) processSplit(split *raft_cmdpb.SplitRequest) {
+	if err := util.CheckKeyInRegion(split.SplitKey, d.Region()); err != nil {
+		log.Warnf("[S%d] process split %+v, err: %+v, region: %+v", d.PeerId(), err, *split, d.Region())
+		return
+	}
+
 	oldRegion := new(metapb.Region)
 	util.CloneMsg(d.Region(), oldRegion)
 	oldRegion.RegionEpoch.Version++
@@ -146,29 +150,36 @@ func (d *peerMsgHandler) processSpilt(split *raft_cmdpb.SplitRequest) {
 	meta := d.ctx.storeMeta
 	// 更新旧region的meta，否则可能checkSnapshot时版本不一致，内存和数据库一致性
 	meta.Lock()
+	defer meta.Unlock()
 	meta.regionRanges.ReplaceOrInsert(&regionItem{oldRegion})
 	meta.regions[oldRegion.Id] = oldRegion
-	meta.Unlock()
 
 	d.SizeDiffHint = 0
 
 	log.Infof("[S%d] process split old %+v, new %+v", d.PeerId(), oldRegion, newRegion)
 
+	// create peer需要加锁，因为在store_worker中收到选举请求会replicate peer，两个协程并发，
+	// 有概率会使ApplyState与RaftState重复设置，导致storage的FirstIndex与LastIndex不一致
+	// panic: init log entries firstIdx=1 lastIdx=5 err: requested entry at index is unavailable
 	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
-	if err == nil {
-		d.ctx.router.register(newPeer)
-		meta.Lock()
-		meta.regionRanges.ReplaceOrInsert(&regionItem{newRegion})
-		meta.regions[newRegion.Id] = newRegion
-		meta.Unlock()
-		d.peerStorage.UpdateRegionState(newRegion)
-		_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
+	if err != nil {
+		log.Panicf("[S%d] create new peer err: %+v, new region: %+v", d.PeerId(), err, newRegion)
+	}
 
+	d.ctx.router.register(newPeer)
+	meta.regionRanges.ReplaceOrInsert(&regionItem{newRegion})
+	meta.regions[newRegion.Id] = newRegion
+	d.peerStorage.UpdateRegionState(newRegion)
+	_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
+
+	// leader通知即可
+	if d.IsLeader() {
 		// 由于partition及unreliable，新创建的region可能选出leader的时间较长，
-		// 而只有leader通过心跳通知scheduler，从而导致出现find no region的错误
+		// 而只有leader定时通知scheduler，从而导致出现find no region的错误
 		notifyScheduler := func(peer *peer) {
 			peer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 		}
+		notifyScheduler(d.peer)
 		notifyScheduler(newPeer)
 	}
 }
@@ -231,7 +242,7 @@ func (d *peerMsgHandler) processNormal(entry eraftpb.Entry) {
 				case raft_cmdpb.AdminCmdType_CompactLog:
 					d.processCompactLog(msg.AdminRequest.CompactLog)
 				case raft_cmdpb.AdminCmdType_Split:
-					d.processSpilt(msg.AdminRequest.Split)
+					d.processSplit(msg.AdminRequest.Split)
 				}
 			}
 		}
@@ -287,6 +298,7 @@ func (d *peerMsgHandler) processConfChange(entry eraftpb.Entry) {
 	err := cc.Unmarshal(entry.Data)
 	if err != nil {
 		log.Infof("[S%d] %+v Unmarshal ConfChange error", d.PeerId(), err)
+		BindRespError(resp, err)
 	} else {
 		log.Infof("[S%d] apply config change = %+v", d.PeerId(), cc)
 		exist := d.updateConf(cc)
@@ -425,6 +437,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 
 func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	var key []byte
+	checkKey := true
 	req := msg.Requests[0]
 	switch req.CmdType {
 	case raft_cmdpb.CmdType_Put:
@@ -433,11 +446,15 @@ func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *mess
 		key = req.Delete.Key
 	case raft_cmdpb.CmdType_Get:
 		key = req.Get.Key
+	default:
+		checkKey = false
 	}
 
-	if engine_util.ExceedEndKey(key, d.Region().EndKey) {
-		cb.Done(ErrResp(&util.ErrKeyNotInRegion{Key: key, Region: d.Region()}))
-		return
+	if checkKey {
+		if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
 	}
 
 	// 将整个请求序列化为字节流
@@ -458,16 +475,19 @@ func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *mess
 func (d *peerMsgHandler) proposeInternal(msg *raft_cmdpb.RaftCmdRequest) {
 	data, err := msg.Marshal()
 	if err != nil {
+		log.Warnf("[S%d] propose msg: %+v, err: %+v", d.PeerId(), *msg, err)
 		return
 	}
 
 	if err := d.RaftGroup.Propose(data); err != nil {
+		log.Warnf("[S%d] propose msg: %+v, err: %+v", d.PeerId(), *msg, err)
 		return
 	}
 }
 
 func (d *peerMsgHandler) proposeConf(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	if msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+	if msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() &&
+		msg.AdminRequest.ChangePeer.ChangeType == eraftpb.ConfChangeType_RemoveNode {
 		transferee := d.RaftGroup.LeadTransferee()
 		d.RaftGroup.TransferLeader(transferee)
 		cb.Done(ErrResp(&util.ErrNotLeader{
@@ -500,6 +520,14 @@ func (d *peerMsgHandler) proposeTransferLeader(msg *raft_cmdpb.RaftCmdRequest, c
 	cb.Done(resp)
 }
 
+func (d *peerMsgHandler) proposeSplit(msg *raft_cmdpb.RaftCmdRequest) {
+	if err := util.CheckKeyInRegion(msg.AdminRequest.Split.SplitKey, d.Region()); err != nil {
+		log.Warnf("[S%d] propose split msg: %+v, err: %+v", d.PeerId(), *msg, err)
+		return
+	}
+	d.proposeInternal(msg)
+}
+
 func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	switch msg.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
@@ -507,7 +535,7 @@ func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb 
 	case raft_cmdpb.AdminCmdType_ChangePeer:
 		d.proposeConf(msg, cb)
 	case raft_cmdpb.AdminCmdType_Split:
-		d.proposeInternal(msg)
+		d.proposeSplit(msg)
 	case raft_cmdpb.AdminCmdType_TransferLeader:
 		d.proposeTransferLeader(msg, cb)
 	}
