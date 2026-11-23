@@ -229,7 +229,7 @@ func (r *Raft) sendAppends() {
 	r.resetElectionTimeout()
 }
 
-func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
+func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) *pb.Message {
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err != nil {
 		log.Panicf("%s send append entries prev log term err: %+v", r.logPrefix, err)
@@ -250,7 +250,7 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	//copy(entries, r.RaftLog.allEntries()[lastIdx-prevLogIndex:])
 
 	log.Debugf("%s send append entries to [S%d]: lastIdx=%+v, push entries = %+v", r.logPrefix, to, lastIdx, entries)
-	msg := pb.Message{
+	msg := &pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		From:    r.id,
 		To:      to,
@@ -275,9 +275,9 @@ func (r *Raft) buildAppend(prevLogIndex uint64, to uint64) pb.Message {
 	return msg
 }
 
-func (r *Raft) buildSnapshotMsg(prevLogIndex uint64, to uint64, snapshot *pb.Snapshot) pb.Message {
+func (r *Raft) buildSnapshotMsg(prevLogIndex uint64, to uint64, snapshot *pb.Snapshot) *pb.Message {
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
-	msg := pb.Message{
+	msg := &pb.Message{
 		MsgType:  pb.MessageType_MsgSnapshot,
 		From:     r.id,
 		To:       to,
@@ -294,8 +294,8 @@ func (r *Raft) buildSnapshotMsg(prevLogIndex uint64, to uint64, snapshot *pb.Sna
 	return msg
 }
 
-func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
-	var msg pb.Message
+func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) *pb.Message {
+	var msg *pb.Message
 	if r.RaftLog.pendingSnapshot != nil {
 		return r.buildSnapshotMsg(prevLogIndex, to, r.RaftLog.pendingSnapshot)
 	}
@@ -311,7 +311,7 @@ func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
 			if err == nil {
 				msg = r.buildSnapshotMsg(prevLogIndex, to, &snapshot)
 			} else {
-				msg = r.buildAppend(prevLogIndex, to)
+				msg = nil
 			}
 			break
 		}
@@ -324,7 +324,7 @@ func (r *Raft) buildSnapshot(prevLogIndex uint64, to uint64) pb.Message {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	var msg pb.Message
+	var msg *pb.Message
 	prevLogIndex := r.Prs[to].Next - 1
 	firstIdx, err := r.RaftLog.FirstIndex()
 	if err != nil {
@@ -338,7 +338,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg = r.buildAppend(prevLogIndex, to)
 	}
 
-	r.msgs = append(r.msgs, msg)
+	if msg != nil {
+		r.msgs = append(r.msgs, *msg)
+	}
 	return true
 }
 
